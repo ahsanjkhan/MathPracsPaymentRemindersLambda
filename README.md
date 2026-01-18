@@ -4,7 +4,7 @@ This is the implementation of an AWS Lambda Function which is defined in the htt
 
 The purpose of this Lambda is to process automated payment text message reminders for students enrolled in tutoring with MathPracs.
 
-You can learn more about MathPracs at https://mathpracstutoring.com
+You can learn more about MathPracs at https://mathpracs.com
 
 ### How Does It Work
 
