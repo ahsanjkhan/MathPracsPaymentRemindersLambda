@@ -145,8 +145,15 @@ def get_calendar_service(oauth_credentials: Dict[str, str]) -> Resource:
 def get_all_calendar_events(service: Resource, start_date: str, end_date: str) -> Dict[str, int]:
     events = {}
     
-    start_time = f"{start_date}T00:00:00Z"
-    end_time = f"{end_date}T23:59:59Z"
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+    
+    chicago_tz = ZoneInfo('America/Chicago')
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d').replace(hour=0, minute=0, second=0, tzinfo=chicago_tz)
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59, tzinfo=chicago_tz)
+    
+    start_time = start_dt.isoformat()
+    end_time = end_dt.isoformat()
     
     try:
         calendar_list = service.calendarList().list().execute()
