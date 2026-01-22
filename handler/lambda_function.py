@@ -73,16 +73,18 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                             'processed_sms': False
                         })
                         
-                        message_body = (f"Hello, the total due for {event_name} for last week ({week_start} to {week_end}) is ${amount_due:.2f}. "
+                        calculation = f"({hourly_rate:.0f}*{total_hours:.1f})"
+                        message_body = (f"Hello, the total due for {event_name} with MathPracs for last week ({week_start} to {week_end}) is ${amount_due:.2f} {calculation}.\n\n"
                                         f"Payment info: https://docs.google.com/document/d/1eR0Ld4fyhbk7xHOeg4_YRCP3Ybk3eE6Xyxb5hFCWDgU/edit?usp=drive_link")
                         
                         for phone in phone_numbers:
-                            print(f"Would have sent message {message_body} to {phone}")
-                            # twilio_client.messages.create(
-                            #     body=message_body,
-                            #     from_=secrets['twilioPhoneNumber'],
-                            #     to=phone
-                            # )
+                            print(f"Sending message {message_body} to {phone}")
+                            twilio_client.messages.create(
+                                body=message_body,
+                                from_=secrets['twilioPhoneNumber'],
+                                to=phone,
+                                messaging_service_sid=None
+                            )
                         table.update_item(
                             Key={'uid': uid},
                             UpdateExpression='SET processed_sms = :val',
@@ -221,7 +223,8 @@ def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[s
                 hourly_4_hour_rate = float(row[13])
                 hourly_5_hour_rate = float(row[14])
                 
-                phone_numbers = [phone4, phone5]
+                # phone_numbers = [phone4, phone5]
+                phone_numbers = [phone5]
                 
                 sheet_data.append({
                     'event_name': event_name,
