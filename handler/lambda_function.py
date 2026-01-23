@@ -1,16 +1,19 @@
 import json
-import boto3
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Union
 from decimal import Decimal
-from google.oauth2.credentials import Credentials
-from google.oauth2 import service_account
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.discovery import Resource
-from twilio.rest import Client
+from typing import Dict, List, Tuple, Union
+from zoneinfo import ZoneInfo
+
+import boto3
 from aws_lambda_typing import context as lambda_context
+from google.auth.transport.requests import Request
+from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import Resource
+from googleapiclient.discovery import build
+from twilio.rest import Client
+
 
 def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context: lambda_context.Context) -> Dict[str, Union[str, int]]:
     try:
@@ -77,19 +80,26 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                         message_body = (f"Hello, the total due for {event_name} with MathPracs for last week ({week_start} to {week_end}) is ${amount_due:.2f} {calculation}.\n\n"
                                         f"Payment info: https://docs.google.com/document/d/1eR0Ld4fyhbk7xHOeg4_YRCP3Ybk3eE6Xyxb5hFCWDgU/edit?usp=drive_link")
                         
+                        any_sent = False
                         for phone in phone_numbers:
                             print(f"Sending message {message_body} to {phone}")
-                            twilio_client.messages.create(
-                                body=message_body,
-                                from_=secrets['twilioPhoneNumber'],
-                                to=phone,
-                                messaging_service_sid=None
+                            try:
+                                twilio_client.messages.create(
+                                    body=message_body,
+                                    from_=secrets['twilioPhoneNumber'],
+                                    to=phone,
+                                    messaging_service_sid=None
+                                )
+                                any_sent = True
+                            except Exception as e:
+                                print(f"Failed to send SMS to {phone}: {e}")
+                        
+                        if any_sent:
+                            table.update_item(
+                                Key={'uid': uid},
+                                UpdateExpression='SET processed_sms = :val',
+                                ExpressionAttributeValues={':val': True}
                             )
-                        table.update_item(
-                            Key={'uid': uid},
-                            UpdateExpression='SET processed_sms = :val',
-                            ExpressionAttributeValues={':val': True}
-                        )
                 except Exception as e:
                     print(f"Error processing DDB update with uid: {uid}. Exception: {e}")
                 
@@ -144,9 +154,6 @@ def get_calendar_service(oauth_credentials: Dict[str, str]) -> Resource:
 
 def get_all_calendar_events(service: Resource, start_date: str, end_date: str) -> Dict[str, int]:
     events = {}
-    
-    from datetime import timezone
-    from zoneinfo import ZoneInfo
     
     chicago_tz = ZoneInfo('America/Chicago')
     start_dt = datetime.strptime(start_date, '%Y-%m-%d').replace(hour=0, minute=0, second=0, tzinfo=chicago_tz)
