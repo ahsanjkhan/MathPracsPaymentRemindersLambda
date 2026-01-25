@@ -20,7 +20,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         print(f"Received Event: {event}")
         print(f"Received Context: {context}")
 
-        table_name = os.environ.get('PAYMENT_TABLE_NAME')
+        table_name = os.environ.get('STUDENT_PAYMENT_TABLE_NAME')
         secrets_arn = os.environ.get('SECRETS_ARN')
         
         secrets = get_secrets(secrets_arn)
@@ -113,7 +113,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': 'MathPracs Payment Reminder executed successfully',
+                'message': 'MathPracs Student Payment Reminder executed successfully',
                 'results': results
             })
         }
