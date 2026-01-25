@@ -26,7 +26,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         secrets = get_secrets(secrets_arn)
         week_start, week_end = get_previous_week_range()
         
-        calendar_service = get_calendar_service(json.loads(secrets['googleCalendarOAuthCredentials']))
+        calendar_service, _ = get_calendar_service(json.loads(secrets['googleCalendarOAuthCredentials']), secrets_arn)
         event_name_to_total_minutes = get_all_calendar_events(calendar_service, week_start, week_end)
         
         sheets_service = get_sheets_service(secrets['googleSheetsCredentials'])
@@ -137,7 +137,7 @@ def get_previous_week_range() -> Tuple[str, str]:
     
     return last_sunday.strftime('%Y-%m-%d'), last_saturday.strftime('%Y-%m-%d')
 
-def get_calendar_service(oauth_credentials: Dict[str, str]) -> Resource:
+def get_calendar_service(oauth_credentials: Dict[str, str], secrets_arn: str) -> Tuple[Resource, bool]:
     credentials = Credentials(
         token=oauth_credentials['access_token'],
         refresh_token=oauth_credentials['refresh_token'],
@@ -147,10 +147,22 @@ def get_calendar_service(oauth_credentials: Dict[str, str]) -> Resource:
         scopes=['https://www.googleapis.com/auth/calendar.readonly']
     )
     
+    refreshed = False
     if credentials.expired:
         credentials.refresh(Request())
+        refreshed = True
+        update_oauth_tokens(secrets_arn, credentials.token, credentials.refresh_token)
     
-    return build('calendar', 'v3', credentials=credentials)
+    return build('calendar', 'v3', credentials=credentials), refreshed
+
+def update_oauth_tokens(secrets_arn: str, access_token: str, refresh_token: str) -> None:
+    client = boto3.client('secretsmanager')
+    secret = json.loads(client.get_secret_value(SecretId=secrets_arn)['SecretString'])
+    oauth_creds = json.loads(secret['googleCalendarOAuthCredentials'])
+    oauth_creds['access_token'] = access_token
+    oauth_creds['refresh_token'] = refresh_token
+    secret['googleCalendarOAuthCredentials'] = json.dumps(oauth_creds)
+    client.update_secret(SecretId=secrets_arn, SecretString=json.dumps(secret))
 
 def get_all_calendar_events(service: Resource, start_date: str, end_date: str) -> Dict[str, int]:
     events = {}
