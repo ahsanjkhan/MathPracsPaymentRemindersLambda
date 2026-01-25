@@ -26,12 +26,12 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         secrets = get_secrets(secrets_arn)
         month_start, month_end = get_previous_month_range()
         
-        calendar_service = get_calendar_service(json.loads(secrets['googleCalendarOAuthCredentials']))
+        calendar_service, _ = get_calendar_service(json.loads(secrets['googleCalendarOAuthCredentials']), secrets_arn)
         sheets_service = get_sheets_service(secrets['googleSheetsCredentials'])
         sheet_data = get_sheet_data(sheets_service)
         
         valid_event_names = {row['event_name'] for row in sheet_data}
-        phone_numbers = [row['phone_numbers'][0] for row in sheet_data if row['phone_numbers']]
+        phone_numbers = list(set([row['phone_numbers'][0] for row in sheet_data if row['phone_numbers']]))
         
         dynamodb = boto3.resource('dynamodb')
         table = dynamodb.Table(table_name)
@@ -43,9 +43,9 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         for calendar_item in calendar_list.get('items', []):
             calendar_name = calendar_item['summary']
             calendar_id = calendar_item['id']
-            
+
             total_minutes = get_calendar_events_for_month(calendar_service, calendar_id, month_start, month_end, valid_event_names)
-            
+
             if total_minutes > 0:
                 total_hours = total_minutes / 60.0
                 amount_due = total_hours * 10
@@ -126,7 +126,7 @@ def get_previous_month_range() -> Tuple[str, str]:
     
     return first_of_previous_month.strftime('%Y-%m-%d'), last_of_previous_month.strftime('%Y-%m-%d')
 
-def get_calendar_service(oauth_credentials: Dict[str, str]) -> Resource:
+def get_calendar_service(oauth_credentials: Dict[str, str], secrets_arn: str) -> Tuple[Resource, bool]:
     credentials = Credentials(
         token=oauth_credentials['access_token'],
         refresh_token=oauth_credentials['refresh_token'],
@@ -136,10 +136,13 @@ def get_calendar_service(oauth_credentials: Dict[str, str]) -> Resource:
         scopes=['https://www.googleapis.com/auth/calendar.readonly']
     )
     
+    refreshed = False
     if credentials.expired:
         credentials.refresh(Request())
+        refreshed = True
+        update_oauth_tokens(secrets_arn, credentials.token, credentials.refresh_token)
     
-    return build('calendar', 'v3', credentials=credentials)
+    return build('calendar', 'v3', credentials=credentials), refreshed
 
 def get_calendar_events_for_month(service: Resource, calendar_id: str, start_date: str, end_date: str, valid_event_names: set) -> int:
     total_minutes = 0
@@ -183,6 +186,15 @@ def get_sheets_service(credentials_json: str) -> Resource:
         credentials_dict, scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
     )
     return build('sheets', 'v4', credentials=credentials)
+
+def update_oauth_tokens(secrets_arn: str, access_token: str, refresh_token: str) -> None:
+    client = boto3.client('secretsmanager')
+    secret = json.loads(client.get_secret_value(SecretId=secrets_arn)['SecretString'])
+    oauth_creds = json.loads(secret['googleCalendarOAuthCredentials'])
+    oauth_creds['access_token'] = access_token
+    oauth_creds['refresh_token'] = refresh_token
+    secret['googleCalendarOAuthCredentials'] = json.dumps(oauth_creds)
+    client.update_secret(SecretId=secrets_arn, SecretString=json.dumps(secret))
 
 def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[str]]]]:
     spreadsheet_id = '1-7aLNLkeUJmolMjaLVdjxjCa49fQxwWfwJ6aVfi0YSw'
