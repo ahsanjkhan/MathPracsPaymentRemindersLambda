@@ -44,11 +44,13 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             calendar_name = calendar_item['summary']
             calendar_id = calendar_item['id']
 
-            total_minutes = get_calendar_events_for_month(calendar_service, calendar_id, month_start, month_end, valid_event_names)
+            session_minutes = get_calendar_events_for_month(calendar_service, calendar_id, month_start, month_end, valid_event_names)
+            no_show_minutes = get_calendar_no_shows_for_month(calendar_service, calendar_id, month_start, month_end, valid_event_names)
 
-            if total_minutes > 0:
-                total_hours = total_minutes / 60.0
-                amount_due = total_hours * 10
+            if session_minutes > 0 or no_show_minutes > 0:
+                session_hours = session_minutes / 60.0
+                no_show_hours = no_show_minutes / 60.0
+                amount_due = (session_hours * 10) + (no_show_hours * 10)
                 
                 uid = f"{calendar_name}#{month_start}#{month_end}"
                 
@@ -62,12 +64,13 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                             'calendar_name': calendar_name,
                             'month_start': month_start,
                             'month_end': month_end,
-                            'minutes': total_minutes,
+                            'session_minutes': session_minutes,
+                            'no_show_minutes': no_show_minutes,
                             'amount_due': Decimal(str(amount_due)),
                             'processed_sms': False
                         })
                         
-                        message_body = f"The total payment for {calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} (10*{total_hours:.1f})."
+                        message_body = f"The total payment for {calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} (10*{session_hours:.1f} for sessions + 10*{no_show_hours:.1f} for no-shows)."
                         
                         any_sent = False
                         for phone in phone_numbers:
@@ -94,7 +97,8 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 
                 results.append({
                     'calendar_name': calendar_name,
-                    'minutes': total_minutes,
+                    'session_minutes': session_minutes,
+                    'no_show_minutes': no_show_minutes,
                     'amount_due': amount_due,
                     'sms_sent': len(phone_numbers)
                 })
@@ -143,6 +147,43 @@ def get_calendar_service(oauth_credentials: Dict[str, str], secrets_arn: str) ->
         update_oauth_tokens(secrets_arn, credentials.token, credentials.refresh_token)
     
     return build('calendar', 'v3', credentials=credentials), refreshed
+
+def get_calendar_no_shows_for_month(service: Resource, calendar_id: str, start_date: str, end_date: str, valid_event_names: set) -> int:
+    no_show_search_term = '(no-show)'
+    total_minutes = 0
+
+    chicago_tz = ZoneInfo('America/Chicago')
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d').replace(hour=0, minute=0, second=0, tzinfo=chicago_tz)
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59, tzinfo=chicago_tz)
+
+    start_time = start_dt.isoformat()
+    end_time = end_dt.isoformat()
+
+    try:
+        events_result = service.events().list(
+            calendarId=calendar_id,
+            timeMin=start_time,
+            timeMax=end_time,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        for event in events_result.get('items', []):
+            if 'summary' not in event or 'start' not in event or 'end' not in event:
+                continue
+
+            event_name = event['summary']
+
+            if no_show_search_term in event_name and any(valid_name in event_name for valid_name in valid_event_names):
+                start_time_dt = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
+                end_time_dt = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')))
+                duration_minutes = int((end_time_dt - start_time_dt).total_seconds() / 60.0)
+                total_minutes += duration_minutes
+
+    except Exception:
+        pass
+
+    return total_minutes
 
 def get_calendar_events_for_month(service: Resource, calendar_id: str, start_date: str, end_date: str, valid_event_names: set) -> int:
     total_minutes = 0
