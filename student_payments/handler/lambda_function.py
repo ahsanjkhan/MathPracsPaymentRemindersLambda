@@ -41,23 +41,47 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             event_name = row['event_name']
             hourly_rate = row['standard_hourly_rate']
             phone_numbers = row['phone_numbers']
-            
+
+            total_session_minutes = 0
+            total_session_hours = 0
+            total_due_for_sessions = 0
+
+            no_show_event_name = event_name + " (no-show)"
+            total_no_show_minutes = 0
+            total_no_show_hours = 0
+            total_due_for_no_shows = 0
+
+            if no_show_event_name in event_name_to_total_minutes:
+                total_no_show_minutes = event_name_to_total_minutes[no_show_event_name]
+                total_no_show_hours = total_no_show_minutes / 60.0
+                total_due_for_no_shows = total_no_show_hours * 10.0
+
             if event_name in event_name_to_total_minutes:
-                total_minutes = event_name_to_total_minutes[event_name]
-                total_hours = total_minutes / 60.0
+                total_session_minutes = event_name_to_total_minutes[event_name]
+                total_session_hours = total_session_minutes / 60.0
                 
-                if total_hours < 2:
+                if total_session_hours < 2:
                     hourly_rate = row['hourly_1_rate']
-                elif total_hours < 3:
+                elif total_session_hours < 3:
                     hourly_rate = row['hourly_2_rate']
-                elif total_hours < 4:
+                elif total_session_hours < 4:
                     hourly_rate = row['hourly_3_rate']
-                elif total_hours < 5:
+                elif total_session_hours < 5:
                     hourly_rate = row['hourly_4_rate']
                 else:
                     hourly_rate = row['hourly_5_rate']
-                
-                amount_due = total_hours * hourly_rate
+
+                total_due_for_sessions = total_session_hours * hourly_rate
+
+            if total_due_for_sessions > 0 or total_due_for_no_shows > 0:
+                if total_due_for_sessions > 0 and total_due_for_no_shows > 0:
+                    calculation = f"({hourly_rate:.0f}*{total_session_hours:.1f} for sessions + 10*{total_no_show_hours:.1f} for no-shows)"
+                elif total_due_for_sessions > 0 and total_due_for_no_shows <= 0:
+                    calculation = f"({hourly_rate:.0f}*{total_session_hours:.1f})"
+                else:
+                    calculation = f"(10*{total_no_show_hours:.1f} for no-shows)"
+
+                total_amount_due = total_due_for_sessions + total_due_for_no_shows
                 
                 uid = f"{event_name}#{week_start}#{week_end}"
                 
@@ -71,13 +95,14 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                             'event_name': event_name,
                             'week_start': week_start,
                             'week_end': week_end,
-                            'minutes': total_minutes,
-                            'amount_due': Decimal(str(amount_due)),
+                            'session_minutes': total_session_minutes,
+                            'no_show_minutes': total_no_show_minutes,
+                            'amount_due': Decimal(str(total_amount_due)),
                             'processed_sms': False
                         })
                         
-                        calculation = f"({hourly_rate:.0f}*{total_hours:.1f})"
-                        message_body = (f"Hello, the total due for {event_name} with MathPracs for last week ({week_start} to {week_end}) is ${amount_due:.2f} {calculation}.\n\n"
+
+                        message_body = (f"Hello, the total due for {event_name} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}.\n\n"
                                         f"Payment info: https://docs.google.com/document/d/1eR0Ld4fyhbk7xHOeg4_YRCP3Ybk3eE6Xyxb5hFCWDgU/edit?usp=drive_link")
                         
                         any_sent = False
@@ -105,8 +130,9 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 
                 results.append({
                     'event_name': event_name,
-                    'minutes': total_minutes,
-                    'amount_due': amount_due,
+                    'session_minutes': total_session_minutes,
+                    'no_show_minutes': total_no_show_minutes,
+                    'amount_due': total_amount_due,
                     'sms_sent': len([p for p in phone_numbers if p])
                 })
         
