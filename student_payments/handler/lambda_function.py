@@ -12,6 +12,8 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import Resource
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from twilio.rest import Client
 
 
@@ -25,12 +27,17 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         
         secrets = get_secrets(secrets_arn)
         week_start, week_end = get_previous_week_range()
+        print(f"Processing week: {week_start} to {week_end}")
         
         calendar_service, _ = get_calendar_service(json.loads(secrets['googleCalendarOAuthCredentials']), secrets_arn)
         event_name_to_total_minutes = get_all_calendar_events(calendar_service, week_start, week_end)
+        print(f"Found {len(event_name_to_total_minutes)} unique event names in calendars")
+        print(f"Calendar events: {list(event_name_to_total_minutes.keys())}")
         
         sheets_service = get_sheets_service(secrets['googleSheetsCredentials'])
         sheet_data = get_sheet_data(sheets_service)
+        print(f"Found {len(sheet_data)} rows in Google Sheet")
+        print(f"Sheet event names: {[row['event_name'] for row in sheet_data]}")
         
         dynamodb = boto3.resource('dynamodb')
         table = dynamodb.Table(table_name)
@@ -39,7 +46,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         results = []
         for row in sheet_data:
             event_name = row['event_name']
-            hourly_rate = row['standard_hourly_rate']
+            hourly_rate = 0 # row['standard_hourly_rate'] Old column
             phone_numbers = row['phone_numbers']
 
             total_session_minutes = 0
@@ -190,6 +197,15 @@ def update_oauth_tokens(secrets_arn: str, access_token: str, refresh_token: str)
     secret['googleCalendarOAuthCredentials'] = json.dumps(oauth_creds)
     client.update_secret(SecretId=secrets_arn, SecretString=json.dumps(secret))
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(HttpError),
+    reraise=True
+)
+def _call_with_retry(request):
+    return request.execute()
+
 def get_all_calendar_events(service: Resource, start_date: str, end_date: str) -> Dict[str, int]:
     events = {}
     
@@ -201,21 +217,29 @@ def get_all_calendar_events(service: Resource, start_date: str, end_date: str) -
     end_time = end_dt.isoformat()
     
     try:
-        calendar_list = service.calendarList().list().execute()
-    except Exception:
+        calendar_list = _call_with_retry(service.calendarList().list())
+    except Exception as e:
+        print(f"Failed to list calendars: {e}")
         return events
     
-    for calendar_item in calendar_list.get('items', []):
+    calendars = calendar_list.get('items', [])
+    print(f"Querying {len(calendars)} calendars for events")
+    
+    for calendar_item in calendars:
         calendar_id = calendar_item['id']
+        calendar_name = calendar_item.get('summary', calendar_id)
         
         try:
-            events_result = service.events().list(
+            events_result = _call_with_retry(service.events().list(
                 calendarId=calendar_id,
                 timeMin=start_time,
                 timeMax=end_time,
                 singleEvents=True,
                 orderBy='startTime'
-            ).execute()
+            ))
+            
+            event_count = len(events_result.get('items', []))
+            print(f"Calendar '{calendar_name}': {event_count} events")
             
             for event in events_result.get('items', []):
                 if 'summary' not in event or 'start' not in event or 'end' not in event:
@@ -232,7 +256,8 @@ def get_all_calendar_events(service: Resource, start_date: str, end_date: str) -
                 else:
                     events[event_name] = duration_minutes
                     
-        except Exception:
+        except Exception as e:
+            print(f"Failed to query calendar '{calendar_name}': {e}")
             continue
     
     return events
@@ -249,10 +274,10 @@ def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[s
     range_name = 'Sheet1!A:O'
     
     try:
-        result = service.spreadsheets().values().get(
+        result = _call_with_retry(service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=range_name
-        ).execute()
+        ))
         
         values = result.get('values', [])
         sheet_data = []
@@ -268,7 +293,7 @@ def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[s
                 phone5 = row[6] # Ahsan
                 phone6 = row[7]
                 phone7 = row[8]
-                standard_hourly_rate = float(row[9])
+                # standard_hourly_rate = float(row[9]) # Old column
                 hourly_1_hour_rate = float(row[10])
                 hourly_2_hour_rate = float(row[11])
                 hourly_3_hour_rate = float(row[12])
@@ -281,7 +306,6 @@ def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[s
                 sheet_data.append({
                     'event_name': event_name,
                     'google_doc_link': google_doc_link,
-                    'standard_hourly_rate': standard_hourly_rate,
                     'hourly_1_rate': hourly_1_hour_rate,
                     'hourly_2_rate': hourly_2_hour_rate,
                     'hourly_3_rate': hourly_3_hour_rate,
@@ -292,5 +316,6 @@ def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[s
         
         return sheet_data
         
-    except Exception:
+    except Exception as e:
+        print(f"Failed to fetch sheet data: {e}")
         return []
