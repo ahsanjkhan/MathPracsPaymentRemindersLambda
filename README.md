@@ -10,7 +10,7 @@ You can learn more about MathPracs at https://mathpracs.com
 
 The Lambdas are invoked by an AWS EventBridge Scheduler Rule.
 
-The student payment reminders are invoked every Sunday at 6:00 PM (Timezone America/Chicago).
+The student payment reminders are invoked every Sunday at 1:00 PM (Timezone America/Chicago).
 
 The tutor payment reminders are invoked every 1st of the Month at 2:00 PM (Timezone America/Chicago).
 
