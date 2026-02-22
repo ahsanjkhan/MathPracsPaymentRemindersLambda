@@ -58,10 +58,10 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             total_no_show_hours = 0
             total_due_for_no_shows = 0
 
+            no_show_rate = 0
             if no_show_event_name in event_name_to_total_minutes:
                 total_no_show_minutes = event_name_to_total_minutes[no_show_event_name]
                 total_no_show_hours = total_no_show_minutes / 60.0
-                total_due_for_no_shows = total_no_show_hours * 10.0
 
             if event_name in event_name_to_total_minutes:
                 total_session_minutes = event_name_to_total_minutes[event_name]
@@ -80,13 +80,17 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
 
                 total_due_for_sessions = total_session_hours * hourly_rate
 
+            if total_no_show_hours > 0:
+                no_show_rate = row['hourly_no_show_rate'] if row['hourly_no_show_rate'] else hourly_rate * 0.5
+                total_due_for_no_shows = total_no_show_hours * no_show_rate
+
             if total_due_for_sessions > 0 or total_due_for_no_shows > 0:
                 if total_due_for_sessions > 0 and total_due_for_no_shows > 0:
-                    calculation = f"({hourly_rate:.0f}*{total_session_hours:.1f} for sessions + 10*{total_no_show_hours:.1f} for no-shows)"
+                    calculation = f"({hourly_rate:.0f}*{total_session_hours:.1f} for sessions + {no_show_rate:.0f}*{total_no_show_hours:.1f} for no-shows)"
                 elif total_due_for_sessions > 0 and total_due_for_no_shows <= 0:
                     calculation = f"({hourly_rate:.0f}*{total_session_hours:.1f})"
                 else:
-                    calculation = f"(10*{total_no_show_hours:.1f} for no-shows)"
+                    calculation = f"({no_show_rate:.0f}*{total_no_show_hours:.1f} for no-shows)"
 
                 total_amount_due = total_due_for_sessions + total_due_for_no_shows
                 
@@ -271,7 +275,7 @@ def get_sheets_service(credentials_json: str) -> Resource:
 
 def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[str]]]]:
     spreadsheet_id = '1-7aLNLkeUJmolMjaLVdjxjCa49fQxwWfwJ6aVfi0YSw'
-    range_name = 'Sheet1!A:O'
+    range_name = 'Sheet1!A:P'
     
     try:
         result = _call_with_retry(service.spreadsheets().values().get(
@@ -299,6 +303,7 @@ def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[s
                 hourly_3_hour_rate = float(row[12])
                 hourly_4_hour_rate = float(row[13])
                 hourly_5_hour_rate = float(row[14])
+                hourly_no_show_rate = float(row[15]) if len(row) > 15 and row[15] else None
                 
                 # phone_numbers = [phone4, phone5]
                 phone_numbers = [phone5]
@@ -311,6 +316,7 @@ def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[s
                     'hourly_3_rate': hourly_3_hour_rate,
                     'hourly_4_rate': hourly_4_hour_rate,
                     'hourly_5_rate': hourly_5_hour_rate,
+                    'hourly_no_show_rate': hourly_no_show_rate,
                     'phone_numbers': phone_numbers
                 })
         
