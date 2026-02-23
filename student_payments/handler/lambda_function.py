@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Dict, List, Tuple, Union
@@ -53,14 +54,16 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             total_session_hours = 0
             total_due_for_sessions = 0
 
-            no_show_event_name = event_name + " (no-show)"
             total_no_show_minutes = 0
             total_no_show_hours = 0
             total_due_for_no_shows = 0
 
             no_show_rate = 0
-            if no_show_event_name in event_name_to_total_minutes:
-                total_no_show_minutes = event_name_to_total_minutes[no_show_event_name]
+            for calendar_event_name, minutes in event_name_to_total_minutes.items():
+                if is_no_show_event(event_name, calendar_event_name):
+                    total_no_show_minutes += minutes
+            
+            if total_no_show_minutes > 0:
                 total_no_show_hours = total_no_show_minutes / 60.0
 
             if event_name in event_name_to_total_minutes:
@@ -325,3 +328,16 @@ def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[s
     except Exception as e:
         print(f"Failed to fetch sheet data: {e}")
         return []
+
+
+def is_no_show_event(event_name: str, calendar_event_name: str) -> bool:
+    """
+    Check if calendar event is a no-show for the given event.
+    event_name: "Joe Tutoring"
+    calendar_event_name: "Joe Tutoring (no-show)" or "Joe Tutoring no-show" etc.
+    """
+    normalized_event = re.sub(r'[^\w\s]', '', calendar_event_name.lower())
+    normalized_base = re.sub(r'[^\w\s]', '', event_name.lower())
+    
+    no_show_pattern = rf'^{re.escape(normalized_base)}\s+no\s*show'
+    return bool(re.search(no_show_pattern, normalized_event))
