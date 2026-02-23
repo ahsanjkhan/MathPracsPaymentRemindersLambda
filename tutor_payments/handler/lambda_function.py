@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from .constants import *
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -177,7 +178,7 @@ def get_calendar_no_shows_for_month(service: Resource, calendar_id: str, start_d
 
             event_name = event[CALENDAR_EVENT_SUMMARY_KEY]
 
-            if no_show_search_term in event_name and any(valid_name in event_name for valid_name in valid_event_names):
+            if any(is_no_show_event(valid_name, event_name) for valid_name in valid_event_names):
                 start_time_dt = datetime.fromisoformat(event[CALENDAR_EVENT_START_KEY].get(CALENDAR_EVENT_DATETIME_KEY, event[CALENDAR_EVENT_START_KEY].get(CALENDAR_EVENT_DATE_KEY)))
                 end_time_dt = datetime.fromisoformat(event[CALENDAR_EVENT_END_KEY].get(CALENDAR_EVENT_DATETIME_KEY, event[CALENDAR_EVENT_END_KEY].get(CALENDAR_EVENT_DATE_KEY)))
                 duration_minutes = int((end_time_dt - start_time_dt).total_seconds() / MINUTES_PER_HOUR)
@@ -280,3 +281,16 @@ def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[s
 
     except Exception:
         return []
+
+
+def is_no_show_event(event_name: str, calendar_event_name: str) -> bool:
+    """
+    Check if calendar event is a no-show for the given event.
+    event_name: "Joe Tutoring"
+    calendar_event_name: "Joe Tutoring (no-show)" or "Joe Tutoring no-show" etc.
+    """
+    normalized_event = re.sub(r'[^\w\s]', '', calendar_event_name.lower())
+    normalized_base = re.sub(r'[^\w\s]', '', event_name.lower())
+    
+    no_show_pattern = rf'^{re.escape(normalized_base)}\s+no\s*show'
+    return bool(re.search(no_show_pattern, normalized_event))
