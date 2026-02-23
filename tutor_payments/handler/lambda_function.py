@@ -214,7 +214,7 @@ def get_calendar_events_for_month(service: Resource, calendar_id: str, start_dat
                 
             event_name = event[CALENDAR_EVENT_SUMMARY_KEY]
             
-            if event_name in valid_event_names:
+            if is_valid_session_event(event_name, valid_event_names):
                 start_time_dt = datetime.fromisoformat(event[CALENDAR_EVENT_START_KEY].get(CALENDAR_EVENT_DATETIME_KEY, event[CALENDAR_EVENT_START_KEY].get(CALENDAR_EVENT_DATE_KEY)))
                 end_time_dt = datetime.fromisoformat(event[CALENDAR_EVENT_END_KEY].get(CALENDAR_EVENT_DATETIME_KEY, event[CALENDAR_EVENT_END_KEY].get(CALENDAR_EVENT_DATE_KEY)))
                 duration_minutes = int((end_time_dt - start_time_dt).total_seconds() / MINUTES_PER_HOUR)
@@ -294,3 +294,22 @@ def is_no_show_event(event_name: str, calendar_event_name: str) -> bool:
     
     no_show_pattern = rf'^{re.escape(normalized_base)}\s+no\s*show'
     return bool(re.search(no_show_pattern, normalized_event))
+
+def is_valid_session_event(calendar_event_name: str, valid_event_names: set) -> bool:
+    """
+    Check if calendar event is a valid session (including demos).
+    Matches case-insensitively and includes demo sessions.
+    calendar_event_name: "Joe Tutoring" or "Joe Tutoring Demo" etc.
+    """
+    normalized_event = re.sub(r'[^\w\s]', '', calendar_event_name.lower())
+    
+    # Remove 'demo' suffix if present for matching
+    normalized_event_base = re.sub(r'\s+demo$', '', normalized_event).strip()
+    
+    # Check if matches any valid event name (case-insensitive)
+    for valid_name in valid_event_names:
+        normalized_valid = re.sub(r'[^\w\s]', '', valid_name.lower())
+        if normalized_event == normalized_valid or normalized_event_base == normalized_valid:
+            return True
+    
+    return False
