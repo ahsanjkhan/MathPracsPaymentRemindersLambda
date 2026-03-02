@@ -1,54 +1,63 @@
 import json
 import os
 import re
-from .constants import *
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Tuple, Union
 from zoneinfo import ZoneInfo
 
 import boto3
+import httpx
 from aws_lambda_typing import context as lambda_context
-from google.auth.transport.requests import Request
-from google.oauth2 import service_account
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import Resource
-from googleapiclient.discovery import build
-from twilio.rest import Client
+
+from .constants import *
+
 
 def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context: lambda_context.Context) -> Dict[str, Union[str, int]]:
     try:
         print(f"Received Event")
 
-        table_name = os.environ.get(ENV_TUTOR_PAYMENT_TABLE_NAME)
-        secrets_arn = os.environ.get(ENV_SECRETS_ARN)
-        
-        secrets = get_secrets(secrets_arn)
-        month_start, month_end = get_previous_month_range()
-        
-        calendar_service, _ = get_calendar_service(json.loads(secrets[SECRET_KEY_GOOGLE_CALENDAR_OAUTH]), secrets_arn)
-        sheets_service = get_sheets_service(secrets[SECRET_KEY_GOOGLE_SHEETS])
-        sheet_data = get_sheet_data(sheets_service)
-        
-        valid_event_names = {row[SHEET_KEY_EVENT_NAME] for row in sheet_data}
-        phone_numbers = list(set([phone for row in sheet_data for phone in row[SHEET_KEY_PHONE_NUMBERS]]))
+        tutors_payment_reminders_table_name = os.environ.get(ENV_TUTOR_PAYMENT_TABLE_NAME)
 
-        tutor_salary_rate_ssm_name = os.environ.get(ENV_TUTOR_SALARY_RATE_SSM_NAME)
-        tutor_salary_rate = float(get_ssm_string_value(tutor_salary_rate_ssm_name))
+        # Cross stack environment variables
+        sessions_table_name = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_SESSIONS_TABLE_NAME)
+        students_table_name = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_STUDENTS_TABLE_NAME)
+        students_metadata_table_name = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_STUDENTS_METADATA_TABLE_NAME)
+        tutors_table_name = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_TUTORS_TABLE_NAME)
+        tutors_metadata_table_name = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_TUTORS_METADATA_TABLE_NAME)
+        discord_secret_arn = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_DISCORD_API_SECRETS_ARN)
 
+        # Cross stack tables
         dynamodb = boto3.resource(AWS_SERVICE_DYNAMODB)
-        table = dynamodb.Table(table_name)
-        twilio_client = Client(secrets[SECRET_KEY_TWILIO_ACCOUNT_SID], secrets[SECRET_KEY_TWILIO_AUTH_TOKEN])
-        
-        results = []
-        calendar_list = calendar_service.calendarList().list().execute()
-        
-        for calendar_item in calendar_list.get(CALENDAR_ITEMS_KEY, []):
-            calendar_name = calendar_item[CALENDAR_SUMMARY_KEY]
-            calendar_id = calendar_item[CALENDAR_ID_KEY]
+        sessions_table = dynamodb.Table(sessions_table_name)
+        students_table = dynamodb.Table(students_table_name)
+        students_metadata_table = dynamodb.Table(students_metadata_table_name)
+        tutors_table = dynamodb.Table(tutors_table_name)
+        tutors_metadata_table = dynamodb.Table(tutors_metadata_table_name)
 
-            session_minutes = get_calendar_events_for_month(calendar_service, calendar_id, month_start, month_end, valid_event_names)
-            no_show_minutes = get_calendar_no_shows_for_month(calendar_service, calendar_id, month_start, month_end, valid_event_names)
+        month_start, month_end = get_previous_month_range()
+
+        valid_event_names = {(student.get('studentName') + ' Tutoring') for student in scan_all_items_from_db(students_metadata_table)}
+        sessions = scan_all_items_from_db(sessions_table)
+
+        tutor_payment_reminders_table = dynamodb.Table(tutors_payment_reminders_table_name)
+
+        secrets_client = boto3.client(AWS_SERVICE_SECRETSMANAGER)
+        discord_secret_response = secrets_client.get_secret_value(SecretId=discord_secret_arn)
+        discord_creds = json.loads(discord_secret_response['SecretString'])
+        discord_bot_token = discord_creds['bot_token']
+        discord_channel_id = discord_creds['tutor_payment_channel_id']
+
+        results = []
+
+        tutors_metadata = scan_all_items_from_db(tutors_metadata_table)
+
+        for tutor in tutors_metadata:
+            tutor_id = tutor.get('tutorId')
+            tutor_salary_rate = float(tutor.get('hourlyRate'))
+            tutor_calendar_name = tutor.get('displayName')
+            session_minutes = get_tutor_sessions_for_month(sessions, tutor_id, month_start, month_end, valid_event_names)
+            no_show_minutes = get_tutor_no_shows_for_month(sessions, tutor_id, month_start, month_end, valid_event_names)
 
             if session_minutes > 0 or no_show_minutes > 0:
                 session_hours = session_minutes / MINUTES_PER_HOUR
@@ -56,55 +65,54 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
 
                 amount_due = (session_hours * tutor_salary_rate) + (no_show_hours * tutor_salary_rate)
                 
-                uid = f"{calendar_name}#{month_start}#{month_end}"
+                uid = f"{tutor_calendar_name}#{month_start}#{month_end}"
                 
                 try:
-                    response = table.get_item(Key={DYNAMODB_KEY_UID: uid})
-                    if DYNAMODB_KEY_ITEM in response and response[DYNAMODB_KEY_ITEM][DYNAMODB_KEY_PROCESSED_SMS]:
+                    response = tutor_payment_reminders_table.get_item(Key={DYNAMODB_KEY_UID: uid})
+                    if DYNAMODB_KEY_ITEM in response and response[DYNAMODB_KEY_ITEM].get(DYNAMODB_KEY_PROCESSED_DISCORD):
                         continue
                     else:
-                        table.put_item(Item={
+                        tutor_payment_reminders_table.put_item(Item={
                             DYNAMODB_KEY_UID: uid,
-                            DYNAMODB_KEY_CALENDAR_NAME: calendar_name,
+                            DYNAMODB_KEY_CALENDAR_NAME: tutor_calendar_name,
                             DYNAMODB_KEY_MONTH_START: month_start,
                             DYNAMODB_KEY_MONTH_END: month_end,
                             DYNAMODB_KEY_SESSION_MINUTES: session_minutes,
                             DYNAMODB_KEY_NO_SHOW_MINUTES: no_show_minutes,
                             DYNAMODB_KEY_AMOUNT_DUE: Decimal(str(amount_due)),
-                            DYNAMODB_KEY_PROCESSED_SMS: False
+                            DYNAMODB_KEY_PROCESSED_SMS: False,
+                            DYNAMODB_KEY_PROCESSED_DISCORD: False
                         })
                         
-                        message_body = f"The total payment for {calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} ({tutor_salary_rate}*{session_hours:.1f} for sessions + {tutor_salary_rate}*{no_show_hours:.1f} for no-shows)."
+                        message_body = f"The total payment for {tutor_calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} ({tutor_salary_rate}\*{session_hours:.1f} for sessions + 10.0\*{no_show_hours:.1f} for no-shows)."
                         
-                        any_sent = False
-                        for phone in phone_numbers:
-                            print(f"Sending message {message_body} to {phone}")
-                            try:
-                                twilio_client.messages.create(
-                                    body=message_body,
-                                    from_=secrets[SECRET_KEY_TWILIO_PHONE_NUMBER],
-                                    to=phone,
-                                    messaging_service_sid=None
-                                )
-                                any_sent = True
-                            except Exception as e:
-                                print(f"Failed to send SMS to {phone}: {e}")
-                        
-                        if any_sent:
-                            table.update_item(
-                                Key={DYNAMODB_KEY_UID: uid},
-                                UpdateExpression=DYNAMODB_UPDATE_EXPRESSION,
-                                ExpressionAttributeValues={':val': True}
+                        print(f"Sending Discord message: {message_body}")
+                        try:
+                            response = httpx.post(
+                                f"https://discord.com/api/v10/channels/{discord_channel_id}/messages",
+                                headers={
+                                    "Authorization": f"Bot {discord_bot_token}",
+                                    "Content-Type": "application/json"
+                                },
+                                json={"content": message_body},
+                                timeout=30.0
                             )
+                            if response.status_code == 200:
+                                tutor_payment_reminders_table.update_item(
+                                    Key={DYNAMODB_KEY_UID: uid},
+                                    UpdateExpression=DYNAMODB_UPDATE_EXPRESSION,
+                                    ExpressionAttributeValues={':val': True}
+                                )
+                        except Exception as e:
+                            print(f"Failed to send Discord message: {e}")
                 except Exception as e:
                     print(f"Error processing DDB update with uid: {uid}. Exception: {e}")
                 
                 results.append({
-                    DYNAMODB_KEY_CALENDAR_NAME: calendar_name,
+                    DYNAMODB_KEY_CALENDAR_NAME: tutor_calendar_name,
                     DYNAMODB_KEY_SESSION_MINUTES: session_minutes,
                     DYNAMODB_KEY_NO_SHOW_MINUTES: no_show_minutes,
-                    DYNAMODB_KEY_AMOUNT_DUE: amount_due,
-                    'sms_sent': len(phone_numbers)
+                    DYNAMODB_KEY_AMOUNT_DUE: amount_due
                 })
         
         return {
@@ -121,11 +129,6 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             'body': json.dumps({RESPONSE_KEY_ERROR: str(e)})
         }
 
-def get_secrets(secrets_arn: str) -> Dict[str, str]:
-    client = boto3.client(AWS_SERVICE_SECRETSMANAGER)
-    response = client.get_secret_value(SecretId=secrets_arn)
-    return json.loads(response['SecretString'])
-
 def get_previous_month_range() -> Tuple[str, str]:
     today = datetime.now()
     first_of_this_month = today.replace(day=1)
@@ -134,154 +137,61 @@ def get_previous_month_range() -> Tuple[str, str]:
     
     return first_of_previous_month.strftime(DATE_FORMAT), last_of_previous_month.strftime(DATE_FORMAT)
 
-def get_calendar_service(oauth_credentials: Dict[str, str], secrets_arn: str) -> Tuple[Resource, bool]:
-    credentials = Credentials(
-        token=oauth_credentials[SECRET_KEY_ACCESS_TOKEN],
-        refresh_token=oauth_credentials[SECRET_KEY_REFRESH_TOKEN],
-        token_uri=oauth_credentials[SECRET_KEY_TOKEN_URI],
-        client_id=oauth_credentials[SECRET_KEY_CLIENT_ID],
-        client_secret=oauth_credentials[SECRET_KEY_CLIENT_SECRET],
-        scopes=[CALENDAR_SCOPE]
-    )
-    
-    refreshed = False
-    if credentials.expired:
-        credentials.refresh(Request())
-        refreshed = True
-        update_oauth_tokens(secrets_arn, credentials.token, credentials.refresh_token)
-    
-    return build(CALENDAR_SERVICE_NAME, CALENDAR_SERVICE_VERSION, credentials=credentials), refreshed
-
-def get_calendar_no_shows_for_month(service: Resource, calendar_id: str, start_date: str, end_date: str, valid_event_names: set) -> int:
-    no_show_search_term = NO_SHOW_SEARCH_TERM
+def get_tutor_no_shows_for_month(sessions: List[Dict], tutor_id: str, start_date: str, end_date: str, valid_event_names: set) -> int:
     total_minutes = 0
 
     chicago_tz = ZoneInfo(TIMEZONE_CHICAGO)
     start_dt = datetime.strptime(start_date, DATE_FORMAT).replace(hour=0, minute=0, second=0, tzinfo=chicago_tz)
     end_dt = datetime.strptime(end_date, DATE_FORMAT).replace(hour=23, minute=59, second=59, tzinfo=chicago_tz)
 
-    start_time = start_dt.isoformat()
-    end_time = end_dt.isoformat()
+    start_time = start_dt.astimezone(timezone.utc).isoformat()
+    end_time = end_dt.astimezone(timezone.utc).isoformat()
 
-    try:
-        events_result = service.events().list(
-            calendarId=calendar_id,
-            timeMin=start_time,
-            timeMax=end_time,
-            singleEvents=True,
-            orderBy=CALENDAR_ORDER_BY
-        ).execute()
+    all_sessions = sessions
+    sessions_for_tutor = [s for s in all_sessions if s.get('tutorId') == tutor_id]
+    sessions_in_date_range = [s for s in sessions_for_tutor if start_time <= s.get('utcStart', '') <= end_time]
 
-        for event in events_result.get(CALENDAR_ITEMS_KEY, []):
-            if CALENDAR_EVENT_SUMMARY_KEY not in event or CALENDAR_EVENT_START_KEY not in event or CALENDAR_EVENT_END_KEY not in event:
-                continue
+    for session in sessions_in_date_range:
+        if 'summary' not in session or 'utcStart' not in session or 'utcEnd' not in session:
+            continue
 
-            event_name = event[CALENDAR_EVENT_SUMMARY_KEY]
+        event_name = session.get('summary')
 
-            if any(is_no_show_event(valid_name, event_name) for valid_name in valid_event_names):
-                start_time_dt = datetime.fromisoformat(event[CALENDAR_EVENT_START_KEY].get(CALENDAR_EVENT_DATETIME_KEY, event[CALENDAR_EVENT_START_KEY].get(CALENDAR_EVENT_DATE_KEY)))
-                end_time_dt = datetime.fromisoformat(event[CALENDAR_EVENT_END_KEY].get(CALENDAR_EVENT_DATETIME_KEY, event[CALENDAR_EVENT_END_KEY].get(CALENDAR_EVENT_DATE_KEY)))
-                duration_minutes = int((end_time_dt - start_time_dt).total_seconds() / MINUTES_PER_HOUR)
-                total_minutes += duration_minutes
-
-    except Exception:
-        pass
+        if any(is_no_show_event(valid_name, event_name) for valid_name in valid_event_names):
+            start_time_dt = datetime.fromisoformat(session.get('utcStart'))
+            end_time_dt = datetime.fromisoformat(session.get('utcEnd'))
+            duration_minutes = int((end_time_dt - start_time_dt).total_seconds() / MINUTES_PER_HOUR)
+            total_minutes += duration_minutes
 
     return total_minutes
 
-def get_calendar_events_for_month(service: Resource, calendar_id: str, start_date: str, end_date: str, valid_event_names: set) -> int:
+def get_tutor_sessions_for_month(sessions: List[Dict], tutor_id: str, start_date: str, end_date: str, valid_event_names: set) -> int:
     total_minutes = 0
-    
+
     chicago_tz = ZoneInfo(TIMEZONE_CHICAGO)
     start_dt = datetime.strptime(start_date, DATE_FORMAT).replace(hour=0, minute=0, second=0, tzinfo=chicago_tz)
     end_dt = datetime.strptime(end_date, DATE_FORMAT).replace(hour=23, minute=59, second=59, tzinfo=chicago_tz)
-    
-    start_time = start_dt.isoformat()
-    end_time = end_dt.isoformat()
-    
-    try:
-        events_result = service.events().list(
-            calendarId=calendar_id,
-            timeMin=start_time,
-            timeMax=end_time,
-            singleEvents=True,
-            orderBy=CALENDAR_ORDER_BY
-        ).execute()
-        
-        for event in events_result.get(CALENDAR_ITEMS_KEY, []):
-            if CALENDAR_EVENT_SUMMARY_KEY not in event or CALENDAR_EVENT_START_KEY not in event or CALENDAR_EVENT_END_KEY not in event:
-                continue
-                
-            event_name = event[CALENDAR_EVENT_SUMMARY_KEY]
-            
-            if is_valid_session_event(event_name, valid_event_names):
-                start_time_dt = datetime.fromisoformat(event[CALENDAR_EVENT_START_KEY].get(CALENDAR_EVENT_DATETIME_KEY, event[CALENDAR_EVENT_START_KEY].get(CALENDAR_EVENT_DATE_KEY)))
-                end_time_dt = datetime.fromisoformat(event[CALENDAR_EVENT_END_KEY].get(CALENDAR_EVENT_DATETIME_KEY, event[CALENDAR_EVENT_END_KEY].get(CALENDAR_EVENT_DATE_KEY)))
-                duration_minutes = int((end_time_dt - start_time_dt).total_seconds() / MINUTES_PER_HOUR)
-                total_minutes += duration_minutes
-                
-    except Exception:
-        pass
-    
+
+    start_time = start_dt.astimezone(timezone.utc).isoformat()
+    end_time = end_dt.astimezone(timezone.utc).isoformat()
+
+    all_sessions = sessions
+    sessions_for_tutor = [s for s in all_sessions if s.get('tutorId') == tutor_id]
+    sessions_in_date_range = [s for s in sessions_for_tutor if start_time <= s.get('utcStart', '') <= end_time]
+
+    for session in sessions_in_date_range:
+        if 'summary' not in session or 'utcStart' not in session or 'utcEnd' not in session:
+            continue
+
+        event_name = session.get('summary')
+
+        if is_valid_session_event(event_name, valid_event_names):
+            start_time_dt = datetime.fromisoformat(session.get('utcStart'))
+            end_time_dt = datetime.fromisoformat(session.get('utcEnd'))
+            duration_minutes = int((end_time_dt - start_time_dt).total_seconds() / MINUTES_PER_HOUR)
+            total_minutes += duration_minutes
+
     return total_minutes
-
-def get_sheets_service(credentials_json: str) -> Resource:
-    credentials_dict = json.loads(credentials_json)
-    credentials = service_account.Credentials.from_service_account_info(
-        credentials_dict, scopes=[SHEETS_SCOPE]
-    )
-    return build(SHEETS_SERVICE_NAME, SHEETS_SERVICE_VERSION, credentials=credentials)
-
-def update_oauth_tokens(secrets_arn: str, access_token: str, refresh_token: str) -> None:
-    client = boto3.client(AWS_SERVICE_SECRETSMANAGER)
-    secret = json.loads(client.get_secret_value(SecretId=secrets_arn)['SecretString'])
-    oauth_creds = json.loads(secret[SECRET_KEY_GOOGLE_CALENDAR_OAUTH])
-    oauth_creds[SECRET_KEY_ACCESS_TOKEN] = access_token
-    oauth_creds[SECRET_KEY_REFRESH_TOKEN] = refresh_token
-    secret[SECRET_KEY_GOOGLE_CALENDAR_OAUTH] = json.dumps(oauth_creds)
-    client.update_secret(SecretId=secrets_arn, SecretString=json.dumps(secret))
-
-def get_ssm_string_value(parameter_name: str) -> str:
-    ssm = boto3.client(AWS_SERVICE_SSM)
-    response = ssm.get_parameter(Name=parameter_name)
-    return response['Parameter']['Value']
-
-def get_ssm_list_of_strings_value(parameter_name: str) -> List[str]:
-    ssm = boto3.client(AWS_SERVICE_SSM)
-    response = ssm.get_parameter(Name=parameter_name)
-    return response['Parameter']['Value'].split(',')
-
-def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[str]]]]:
-    phone_enabled_indices_ssm_name = os.environ.get(ENV_PHONE_ENABLED_COLUMNS_SSM_NAME)
-    phone_enabled_indices = [int(x) for x in get_ssm_list_of_strings_value(phone_enabled_indices_ssm_name)]
-    spreadsheet_id_ssm_name = os.environ.get(ENV_GOOGLE_SHEETS_SSM_NAME)
-    spreadsheet_id = get_ssm_string_value(spreadsheet_id_ssm_name)
-    range_name = SHEETS_RANGE_NAME
-
-    try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=range_name
-        ).execute()
-
-        values = result.get(SHEETS_VALUES_KEY, [])
-        sheet_data = []
-
-        for i, row in enumerate(values[1:], 1):
-            if len(row) >= 0:
-                event_name = row[0]
-                phone_numbers = [row[i] for i in phone_enabled_indices if i < len(row) and row[i]]
-
-                sheet_data.append({
-                    SHEET_KEY_EVENT_NAME: event_name,
-                    SHEET_KEY_PHONE_NUMBERS: phone_numbers
-                })
-
-        return sheet_data
-
-    except Exception:
-        return []
-
 
 def is_no_show_event(event_name: str, calendar_event_name: str) -> bool:
     """
@@ -313,3 +223,16 @@ def is_valid_session_event(calendar_event_name: str, valid_event_names: set) -> 
             return True
     
     return False
+
+def scan_all_items_from_db(table) -> List[Dict]:
+    """Scan all items from a DDB table."""
+    db_items = []
+    response = table.scan()
+    db_items.extend(response.get('Items', []))
+
+    # Handle pagination
+    while 'LastEvaluatedKey' in response:
+        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+        db_items.extend(response.get('Items', []))
+
+    return db_items

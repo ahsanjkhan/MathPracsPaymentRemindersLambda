@@ -132,7 +132,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                                 any_sent = True
                             except Exception as e:
                                 print(f"Failed to send SMS to {phone}: {e}")
-                        
+
                         if any_sent:
                             table.update_item(
                                 Key={'uid': uid},
