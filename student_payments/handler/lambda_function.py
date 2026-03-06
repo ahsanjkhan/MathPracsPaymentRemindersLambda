@@ -1,54 +1,60 @@
 import json
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Tuple, Union
 from zoneinfo import ZoneInfo
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 import boto3
+import httpx
 from aws_lambda_typing import context as lambda_context
-from google.auth.transport.requests import Request
-from google.oauth2 import service_account
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import Resource
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from twilio.rest import Client
-
 
 def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context: lambda_context.Context) -> Dict[str, Union[str, int]]:
     try:
         print(f"Received Event: {event}")
         print(f"Received Context: {context}")
 
-        table_name = os.environ.get('STUDENT_PAYMENT_TABLE_NAME')
-        secrets_arn = os.environ.get('SECRETS_ARN')
+        student_payment_reminders_table_name = os.environ.get('STUDENT_PAYMENT_TABLE_NAME')
+
+        # Cross stack environment variables
+        sessions_table_name = os.environ.get('SESSIONS_TABLE_NAME')
+        students_table_name = os.environ.get('STUDENTS_TABLE_NAME')
+        students_metadata_table_name = os.environ.get('STUDENTS_METADATA_TABLE_NAME')
+        discord_secret_arn = os.environ.get('DISCORD_SECRETS_ARN')
+
+        # Cross stack tables
+        dynamodb = boto3.resource('dynamodb')
+        sessions_table = dynamodb.Table(sessions_table_name)
+        students_table = dynamodb.Table(students_table_name)
+        students_metadata_table = dynamodb.Table(students_metadata_table_name)
         
-        secrets = get_secrets(secrets_arn)
         week_start, week_end = get_previous_week_range()
         print(f"Processing week: {week_start} to {week_end}")
+
+        all_sessions = scan_all_items_from_db(sessions_table)
         
-        calendar_service, _ = get_calendar_service(json.loads(secrets['googleCalendarOAuthCredentials']), secrets_arn)
-        event_name_to_total_minutes = get_all_calendar_events(calendar_service, week_start, week_end)
-        print(f"Found {len(event_name_to_total_minutes)} unique event names in calendars")
-        print(f"Calendar events: {list(event_name_to_total_minutes.keys())}")
-        
-        sheets_service = get_sheets_service(secrets['googleSheetsCredentials'])
-        sheet_data = get_sheet_data(sheets_service)
-        print(f"Found {len(sheet_data)} rows in Google Sheet")
-        print(f"Sheet event names: {[row['event_name'] for row in sheet_data]}")
-        
+        session_name_to_total_minutes = get_last_week_sessions_to_minutes_mapping(all_sessions, week_start, week_end)
+        print(f"Found {len(session_name_to_total_minutes)} unique session names in last week's sessions")
+        print(f"Unique session names: {list(session_name_to_total_minutes.keys())}")
+
         dynamodb = boto3.resource('dynamodb')
-        table = dynamodb.Table(table_name)
-        twilio_client = Client(secrets['twilioAccountSid'], secrets['twilioAuthToken'])
+        student_payment_reminders_table = dynamodb.Table(student_payment_reminders_table_name)
+
+        students = scan_all_items_from_db(students_metadata_table)
+
+        secrets_client = boto3.client('secretsmanager')
+        discord_secret_response = secrets_client.get_secret_value(SecretId=discord_secret_arn)
+        discord_creds = json.loads(discord_secret_response['SecretString'])
+        discord_bot_token = discord_creds['bot_token']
         
         results = []
-        for row in sheet_data:
-            event_name = row['event_name']
-            hourly_rate = 0 # row['standard_hourly_rate'] Old column
-            phone_numbers = row['phone_numbers']
+        for student in students:
+            print(f"Processing student: {student.get('studentName')}")
+            discord_channel_id = student.get('discordChannelReminderId')
+            expected_session_name_for_student = student.get('studentName') + ' Tutoring'
+            hourly_rate = 0
 
             total_session_minutes = 0
             total_session_hours = 0
@@ -59,95 +65,90 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             total_due_for_no_shows = 0
 
             no_show_rate = 0
-            for calendar_event_name, minutes in event_name_to_total_minutes.items():
-                if is_no_show_event(event_name, calendar_event_name):
+            for session_name, minutes in session_name_to_total_minutes.items():
+                if is_no_show_event(expected_session_name_for_student, session_name):
                     total_no_show_minutes += minutes
             
             if total_no_show_minutes > 0:
                 total_no_show_hours = total_no_show_minutes / 60.0
 
-            if event_name in event_name_to_total_minutes:
-                total_session_minutes = event_name_to_total_minutes[event_name]
+            if expected_session_name_for_student in session_name_to_total_minutes:
+                total_session_minutes = session_name_to_total_minutes[expected_session_name_for_student]
                 total_session_hours = total_session_minutes / 60.0
+
+                student_pricing_map = student.get('hourlyPricing')
                 
                 if total_session_hours < 2:
-                    hourly_rate = row['hourly_1_rate']
+                    hourly_rate = float(student_pricing_map.get('1'))
                 elif total_session_hours < 3:
-                    hourly_rate = row['hourly_2_rate']
+                    hourly_rate = float(student_pricing_map.get('2'))
                 elif total_session_hours < 4:
-                    hourly_rate = row['hourly_3_rate']
+                    hourly_rate = float(student_pricing_map.get('3'))
                 elif total_session_hours < 5:
-                    hourly_rate = row['hourly_4_rate']
+                    hourly_rate = float(student_pricing_map.get('4'))
                 else:
-                    hourly_rate = row['hourly_5_rate']
+                    hourly_rate = float(student_pricing_map.get('5'))
 
                 total_due_for_sessions = total_session_hours * hourly_rate
 
             if total_no_show_hours > 0:
-                no_show_rate = row['hourly_no_show_rate'] if row['hourly_no_show_rate'] else hourly_rate * 0.5
+                no_show_rate = float(student.get('noShowCustomRate')) if student.get('noShowCustomRate') else hourly_rate * 0.5
                 total_due_for_no_shows = total_no_show_hours * no_show_rate
 
             if total_due_for_sessions > 0 or total_due_for_no_shows > 0:
                 if total_due_for_sessions > 0 and total_due_for_no_shows > 0:
-                    calculation = f"({hourly_rate:.0f}*{total_session_hours:.1f} for sessions + {no_show_rate:.0f}*{total_no_show_hours:.1f} for no-shows)"
+                    calculation = f"({hourly_rate:.0f}\*{total_session_hours:.1f} for sessions + {no_show_rate:.0f}\*{total_no_show_hours:.1f} for no-shows)"
                 elif total_due_for_sessions > 0 and total_due_for_no_shows <= 0:
-                    calculation = f"({hourly_rate:.0f}*{total_session_hours:.1f})"
+                    calculation = f"({hourly_rate:.0f}\*{total_session_hours:.1f})"
                 else:
-                    calculation = f"({no_show_rate:.0f}*{total_no_show_hours:.1f} for no-shows)"
+                    calculation = f"({no_show_rate:.0f}\*{total_no_show_hours:.1f} for no-shows)"
 
                 total_amount_due = total_due_for_sessions + total_due_for_no_shows
                 
-                uid = f"{event_name}#{week_start}#{week_end}"
+                uid = f"{expected_session_name_for_student}#{week_start}#{week_end}"
+
+                count_discord_messages = 0
                 
                 try:
-                    response = table.get_item(Key={'uid': uid})
-                    if 'Item' in response and response['Item']['processed_sms']:
+                    response = student_payment_reminders_table.get_item(Key={'uid': uid})
+                    if 'Item' in response and response['Item'].get('processed_discord'):
                         continue
                     else:
-                        table.put_item(Item={
+                        student_payment_reminders_table.put_item(Item={
                             'uid': uid,
-                            'event_name': event_name,
+                            'event_name': expected_session_name_for_student,
                             'week_start': week_start,
                             'week_end': week_end,
                             'session_minutes': total_session_minutes,
                             'no_show_minutes': total_no_show_minutes,
                             'amount_due': Decimal(str(total_amount_due)),
-                            'processed_sms': False
+                            'processed_sms': False,
+                            'processed_discord': False
                         })
-                        
 
-                        message_body = (f"Hello, the total due for {event_name} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}.\n\n"
-                                        f"Payment info: https://docs.google.com/document/d/1eR0Ld4fyhbk7xHOeg4_YRCP3Ybk3eE6Xyxb5hFCWDgU/edit?usp=drive_link")
-                        
-                        any_sent = False
-                        for phone in phone_numbers:
-                            print(f"Sending message {message_body} to {phone}")
-                            try:
-                                twilio_client.messages.create(
-                                    body=message_body,
-                                    from_=secrets['twilioPhoneNumber'],
-                                    to=phone,
-                                    messaging_service_sid=None
-                                )
-                                any_sent = True
-                            except Exception as e:
-                                print(f"Failed to send SMS to {phone}: {e}")
+                        message_body = f"Hello, the total due for {expected_session_name_for_student} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}."
 
-                        if any_sent:
-                            table.update_item(
+                        print(f"Sending Discord message: {message_body}")
+                        try:
+                            send_discord_message(discord_bot_token, discord_channel_id, message_body)
+                            student_payment_reminders_table.update_item(
                                 Key={'uid': uid},
-                                UpdateExpression='SET processed_sms = :val',
+                                UpdateExpression='SET processed_discord = :val',
                                 ExpressionAttributeValues={':val': True}
                             )
+                            count_discord_messages += 1
+                        except Exception as e:
+                            print(f"Failed to send Discord message: {e}")
+
                 except Exception as e:
                     print(f"Error processing DDB update with uid: {uid}. Exception: {e}")
                 
                 results.append({
-                    'event_name': event_name,
+                    'event_name': expected_session_name_for_student,
                     'session_minutes': total_session_minutes,
                     'no_show_minutes': total_no_show_minutes,
                     'amount_due': total_amount_due,
-                    'sms_sent': len([p for p in phone_numbers if p])
+                    'discord_messages_sent': count_discord_messages
                 })
         
         return {
@@ -164,10 +165,16 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             'body': json.dumps({'error': str(e)})
         }
 
-def get_secrets(secrets_arn: str) -> Dict[str, str]:
-    client = boto3.client('secretsmanager')
-    response = client.get_secret_value(SecretId=secrets_arn)
-    return json.loads(response['SecretString'])
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), retry=retry_if_exception(lambda e: isinstance(e, httpx.HTTPError)))
+def send_discord_message(discord_bot_token, discord_channel_id, message_body):
+    response = httpx.post(
+        f"https://discord.com/api/v10/channels/{discord_channel_id}/messages",
+        headers={"Authorization": f"Bot {discord_bot_token}", "Content-Type": "application/json"},
+        json={"content": message_body},
+        timeout=30.0
+    )
+    response.raise_for_status()
+    return response
 
 def get_previous_week_range() -> Tuple[str, str]:
     today = datetime.now()
@@ -177,167 +184,51 @@ def get_previous_week_range() -> Tuple[str, str]:
     
     return last_sunday.strftime('%Y-%m-%d'), last_saturday.strftime('%Y-%m-%d')
 
-def get_calendar_service(oauth_credentials: Dict[str, str], secrets_arn: str) -> Tuple[Resource, bool]:
-    credentials = Credentials(
-        token=oauth_credentials['access_token'],
-        refresh_token=oauth_credentials['refresh_token'],
-        token_uri=oauth_credentials['token_uri'],
-        client_id=oauth_credentials['client_id'],
-        client_secret=oauth_credentials['client_secret'],
-        scopes=['https://www.googleapis.com/auth/calendar.readonly']
-    )
-    
-    refreshed = False
-    if credentials.expired:
-        credentials.refresh(Request())
-        refreshed = True
-        update_oauth_tokens(secrets_arn, credentials.token, credentials.refresh_token)
-    
-    return build('calendar', 'v3', credentials=credentials), refreshed
-
-def update_oauth_tokens(secrets_arn: str, access_token: str, refresh_token: str) -> None:
-    client = boto3.client('secretsmanager')
-    secret = json.loads(client.get_secret_value(SecretId=secrets_arn)['SecretString'])
-    oauth_creds = json.loads(secret['googleCalendarOAuthCredentials'])
-    oauth_creds['access_token'] = access_token
-    oauth_creds['refresh_token'] = refresh_token
-    secret['googleCalendarOAuthCredentials'] = json.dumps(oauth_creds)
-    client.update_secret(SecretId=secrets_arn, SecretString=json.dumps(secret))
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(HttpError),
-    reraise=True
-)
-def _call_with_retry(request):
-    return request.execute()
-
-def get_all_calendar_events(service: Resource, start_date: str, end_date: str) -> Dict[str, int]:
-    events = {}
-    
+def get_last_week_sessions_to_minutes_mapping(sessions: List[Dict], start_date: str, end_date: str) -> Dict[str, int]:
     chicago_tz = ZoneInfo('America/Chicago')
     start_dt = datetime.strptime(start_date, '%Y-%m-%d').replace(hour=0, minute=0, second=0, tzinfo=chicago_tz)
     end_dt = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59, tzinfo=chicago_tz)
-    
-    start_time = start_dt.isoformat()
-    end_time = end_dt.isoformat()
-    
-    try:
-        calendar_list = _call_with_retry(service.calendarList().list())
-    except Exception as e:
-        print(f"Failed to list calendars: {e}")
-        return events
-    
-    calendars = calendar_list.get('items', [])
-    print(f"Querying {len(calendars)} calendars for events")
-    
-    for calendar_item in calendars:
-        calendar_id = calendar_item['id']
-        calendar_name = calendar_item.get('summary', calendar_id)
-        
-        try:
-            events_result = _call_with_retry(service.events().list(
-                calendarId=calendar_id,
-                timeMin=start_time,
-                timeMax=end_time,
-                singleEvents=True,
-                orderBy='startTime'
-            ))
-            
-            event_count = len(events_result.get('items', []))
-            print(f"Calendar '{calendar_name}': {event_count} events")
-            
-            for event in events_result.get('items', []):
-                if 'summary' not in event or 'start' not in event or 'end' not in event:
-                    continue
-                    
-                event_name = event['summary']
-                
-                start_time_dt = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
-                end_time_dt = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')))
-                duration_minutes = int((end_time_dt - start_time_dt).total_seconds() / 60.0)
-                
-                if event_name in events:
-                    events[event_name] += duration_minutes
-                else:
-                    events[event_name] = duration_minutes
-                    
-        except Exception as e:
-            print(f"Failed to query calendar '{calendar_name}': {e}")
-            continue
-    
-    return events
 
-def get_sheets_service(credentials_json: str) -> Resource:
-    credentials_dict = json.loads(credentials_json)
-    credentials = service_account.Credentials.from_service_account_info(
-        credentials_dict, scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
-    )
-    return build('sheets', 'v4', credentials=credentials)
+    start_time = start_dt.astimezone(timezone.utc).isoformat()
+    end_time = end_dt.astimezone(timezone.utc).isoformat()
 
-def get_sheet_data(service: Resource) -> List[Dict[str, Union[str, float, List[str]]]]:
-    spreadsheet_id = '1-7aLNLkeUJmolMjaLVdjxjCa49fQxwWfwJ6aVfi0YSw'
-    range_name = 'Sheet1!A:P'
-    
-    try:
-        result = _call_with_retry(service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=range_name
-        ))
-        
-        values = result.get('values', [])
-        sheet_data = []
-        
-        for i, row in enumerate(values[1:], 1):
-            if len(row) >= 15:
-                event_name = row[0]
-                google_doc_link = row[1]
-                phone1 = row[2]
-                phone2 = row[3]
-                phone3 = row[4]
-                phone4 = row[5] # Muaz
-                phone5 = row[6] # Ahsan
-                phone6 = row[7]
-                phone7 = row[8]
-                # standard_hourly_rate = float(row[9]) # Old column
-                hourly_1_hour_rate = float(row[10])
-                hourly_2_hour_rate = float(row[11])
-                hourly_3_hour_rate = float(row[12])
-                hourly_4_hour_rate = float(row[13])
-                hourly_5_hour_rate = float(row[14])
-                hourly_no_show_rate = float(row[15]) if len(row) > 15 and row[15] else None
-                
-                # phone_numbers = [phone4, phone5]
-                phone_numbers = [phone5]
-                
-                sheet_data.append({
-                    'event_name': event_name,
-                    'google_doc_link': google_doc_link,
-                    'hourly_1_rate': hourly_1_hour_rate,
-                    'hourly_2_rate': hourly_2_hour_rate,
-                    'hourly_3_rate': hourly_3_hour_rate,
-                    'hourly_4_rate': hourly_4_hour_rate,
-                    'hourly_5_rate': hourly_5_hour_rate,
-                    'hourly_no_show_rate': hourly_no_show_rate,
-                    'phone_numbers': phone_numbers
-                })
-        
-        return sheet_data
-        
-    except Exception as e:
-        print(f"Failed to fetch sheet data: {e}")
-        return []
+    sessions_in_date_range = [s for s in sessions if start_time <= s.get('utcStart', '') <= end_time]
 
+    session_name_to_total_minutes = {}
 
-def is_no_show_event(event_name: str, calendar_event_name: str) -> bool:
+    for session in sessions_in_date_range:
+        summary = session.get('summary')
+        start_time_dt = datetime.fromisoformat(session.get('utcStart'))
+        end_time_dt = datetime.fromisoformat(session.get('utcEnd'))
+        duration_minutes = int((end_time_dt - start_time_dt).total_seconds() / 60.0)
+        if summary in session_name_to_total_minutes:
+            session_name_to_total_minutes[summary] += duration_minutes
+        else:
+            session_name_to_total_minutes[summary] = duration_minutes
+
+    return session_name_to_total_minutes
+
+def is_no_show_event(standard_session_name: str, session_name: str) -> bool:
     """
-    Check if calendar event is a no-show for the given event.
-    event_name: "Joe Tutoring"
-    calendar_event_name: "Joe Tutoring (no-show)" or "Joe Tutoring no-show" etc.
+    Check if session_name is a no-show for the given standard_session_name.
+    standard_session_name: "Joe Tutoring"
+    session_name: "Joe Tutoring (no-show)" or "Joe Tutoring no-show" etc.
     """
-    normalized_event = re.sub(r'[^\w\s]', '', calendar_event_name.lower())
-    normalized_base = re.sub(r'[^\w\s]', '', event_name.lower())
+    normalized_session = re.sub(r'[^\w\s]', '', session_name.lower())
+    normalized_base = re.sub(r'[^\w\s]', '', standard_session_name.lower())
     
     no_show_pattern = rf'^{re.escape(normalized_base)}\s+no\s*show'
-    return bool(re.search(no_show_pattern, normalized_event))
+    return bool(re.search(no_show_pattern, normalized_session))
+
+def scan_all_items_from_db(table) -> List[Dict]:
+    """Scan all items from a DDB table."""
+    db_items = []
+    response = table.scan()
+    db_items.extend(response.get('Items', []))
+
+    # Handle pagination
+    while 'LastEvaluatedKey' in response:
+        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+        db_items.extend(response.get('Items', []))
+
+    return db_items
