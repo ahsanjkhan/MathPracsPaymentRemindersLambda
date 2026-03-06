@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Tuple, Union
 from zoneinfo import ZoneInfo
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 import boto3
 import httpx
@@ -88,21 +89,12 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                         
                         print(f"Sending Discord message: {message_body}")
                         try:
-                            response = httpx.post(
-                                f"https://discord.com/api/v10/channels/{discord_channel_id}/messages",
-                                headers={
-                                    "Authorization": f"Bot {discord_bot_token}",
-                                    "Content-Type": "application/json"
-                                },
-                                json={"content": message_body},
-                                timeout=30.0
+                            send_discord_message(discord_bot_token, discord_channel_id, message_body)
+                            tutor_payment_reminders_table.update_item(
+                                Key={DYNAMODB_KEY_UID: uid},
+                                UpdateExpression=DYNAMODB_UPDATE_EXPRESSION,
+                                ExpressionAttributeValues={':val': True}
                             )
-                            if response.status_code == 200:
-                                tutor_payment_reminders_table.update_item(
-                                    Key={DYNAMODB_KEY_UID: uid},
-                                    UpdateExpression=DYNAMODB_UPDATE_EXPRESSION,
-                                    ExpressionAttributeValues={':val': True}
-                                )
                         except Exception as e:
                             print(f"Failed to send Discord message: {e}")
                 except Exception as e:
@@ -128,6 +120,17 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             'statusCode': HTTP_STATUS_ERROR,
             'body': json.dumps({RESPONSE_KEY_ERROR: str(e)})
         }
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), retry=retry_if_exception(lambda e: isinstance(e, httpx.HTTPError)))
+def send_discord_message(discord_bot_token, discord_channel_id, message_body):
+    response = httpx.post(
+        f"https://discord.com/api/v10/channels/{discord_channel_id}/messages",
+        headers={"Authorization": f"Bot {discord_bot_token}", "Content-Type": "application/json"},
+        json={"content": message_body},
+        timeout=30.0
+    )
+    response.raise_for_status()
+    return response
 
 def get_previous_month_range() -> Tuple[str, str]:
     today = datetime.now()
