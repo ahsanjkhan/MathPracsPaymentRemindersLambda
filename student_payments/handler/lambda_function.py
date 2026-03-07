@@ -83,17 +83,18 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 total_session_hours = total_session_minutes / 60.0
 
                 student_pricing_map = student_metadata.get('hourlyPricing')
-                
-                if total_session_hours < 2:
-                    hourly_rate = float(student_pricing_map.get('1'))
-                elif total_session_hours < 3:
-                    hourly_rate = float(student_pricing_map.get('2'))
-                elif total_session_hours < 4:
-                    hourly_rate = float(student_pricing_map.get('3'))
-                elif total_session_hours < 5:
-                    hourly_rate = float(student_pricing_map.get('4'))
-                else:
-                    hourly_rate = float(student_pricing_map.get('5'))
+
+                if student_pricing_map is not None:
+                    if total_session_hours < 2:
+                        hourly_rate = float(student_pricing_map.get('1'))
+                    elif total_session_hours < 3:
+                        hourly_rate = float(student_pricing_map.get('2'))
+                    elif total_session_hours < 4:
+                        hourly_rate = float(student_pricing_map.get('3'))
+                    elif total_session_hours < 5:
+                        hourly_rate = float(student_pricing_map.get('4'))
+                    else:
+                        hourly_rate = float(student_pricing_map.get('5'))
 
                 total_due_for_sessions = total_session_hours * hourly_rate
 
