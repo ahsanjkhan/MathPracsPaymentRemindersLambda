@@ -135,12 +135,8 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
 
                         new_balance = previous_balance + float(total_amount_due)
 
-                        message_body = (f"Hello, the amount due for {expected_session_name_for_student} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}.\n"
-                                                f"```\n"
-                                                f"Carry-over balance: ${previous_balance:>8.2f}\n"
-                                                f"Last week's total:  ${total_amount_due:>8.2f} (+)\n"
-                                                f"Total amount owed = ${new_balance:>8.2f}.\n"
-                                                f"```")
+                        message_body = (f"Hello, the amount due for {expected_session_name_for_student} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}.\n\n"
+                                        f"Total balance: ${previous_balance:.2f} (previous balance) + ${total_amount_due:.2f} = ${new_balance:.2f}")
 
 
                         print(f"Sending Discord message: {message_body}")
