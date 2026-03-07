@@ -22,6 +22,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         sessions_table_name = os.environ.get('SESSIONS_TABLE_NAME')
         students_table_name = os.environ.get('STUDENTS_TABLE_NAME')
         students_metadata_table_name = os.environ.get('STUDENTS_METADATA_TABLE_NAME')
+        transactions_table_name = os.environ.get('TRANSACTIONS_TABLE_NAME')
         discord_secret_arn = os.environ.get('DISCORD_SECRETS_ARN')
 
         # Cross stack tables
@@ -29,6 +30,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         sessions_table = dynamodb.Table(sessions_table_name)
         students_table = dynamodb.Table(students_table_name)
         students_metadata_table = dynamodb.Table(students_metadata_table_name)
+        transactions_table = dynamodb.Table(transactions_table_name)
         
         week_start, week_end = get_previous_week_range()
         print(f"Processing week: {week_start} to {week_end}")
@@ -39,10 +41,10 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         print(f"Found {len(session_name_to_total_minutes)} unique session names in last week's sessions")
         print(f"Unique session names: {list(session_name_to_total_minutes.keys())}")
 
-        dynamodb = boto3.resource('dynamodb')
         student_payment_reminders_table = dynamodb.Table(student_payment_reminders_table_name)
 
-        students = scan_all_items_from_db(students_metadata_table)
+        students_metadata = scan_all_items_from_db(students_metadata_table)
+        students_table_mapped_by_student_name = {s['studentName']: s for s in scan_all_items_from_db(students_table)}
 
         secrets_client = boto3.client('secretsmanager')
         discord_secret_response = secrets_client.get_secret_value(SecretId=discord_secret_arn)
@@ -50,10 +52,14 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         discord_bot_token = discord_creds['bot_token']
         
         results = []
-        for student in students:
-            print(f"Processing student: {student.get('studentName')}")
-            discord_channel_id = student.get('discordChannelReminderId')
-            expected_session_name_for_student = student.get('studentName') + ' Tutoring'
+        for student_metadata in students_metadata:
+            student_name = student_metadata.get('studentName')
+            print(f"Processing student: {student_name}")
+            students_table_item = students_table_mapped_by_student_name.get(student_name)
+            previous_balance = float(students_table_item.get('balance') or 0) if students_table_item else 0.0
+
+            discord_channel_id = student_metadata.get('discordChannelReminderId')
+            expected_session_name_for_student = student_metadata.get('studentName') + ' Tutoring'
             hourly_rate = 0
 
             total_session_minutes = 0
@@ -76,7 +82,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 total_session_minutes = session_name_to_total_minutes[expected_session_name_for_student]
                 total_session_hours = total_session_minutes / 60.0
 
-                student_pricing_map = student.get('hourlyPricing')
+                student_pricing_map = student_metadata.get('hourlyPricing')
                 
                 if total_session_hours < 2:
                     hourly_rate = float(student_pricing_map.get('1'))
@@ -92,7 +98,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 total_due_for_sessions = total_session_hours * hourly_rate
 
             if total_no_show_hours > 0:
-                no_show_rate = float(student.get('noShowCustomRate')) if student.get('noShowCustomRate') else hourly_rate * 0.5
+                no_show_rate = float(student_metadata.get('noShowCustomRate')) if student_metadata.get('noShowCustomRate') else hourly_rate * 0.5
                 total_due_for_no_shows = total_no_show_hours * no_show_rate
 
             if total_due_for_sessions > 0 or total_due_for_no_shows > 0:
@@ -108,6 +114,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 uid = f"{expected_session_name_for_student}#{week_start}#{week_end}"
 
                 count_discord_messages = 0
+                count_transactions_recorded = 0
                 
                 try:
                     response = student_payment_reminders_table.get_item(Key={'uid': uid})
@@ -126,7 +133,15 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                             'processed_discord': False
                         })
 
-                        message_body = f"Hello, the total due for {expected_session_name_for_student} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}."
+                        new_balance = previous_balance + float(total_amount_due)
+
+                        message_body = (f"Hello, the amount due for {expected_session_name_for_student} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}.\n"
+                                                f"```\n"
+                                                f"Carry-over balance: ${previous_balance:>8.2f}\n"
+                                                f"Last week's total:  ${total_amount_due:>8.2f} (+)\n"
+                                                f"Total amount owed = ${new_balance:>8.2f}.\n"
+                                                f"```")
+
 
                         print(f"Sending Discord message: {message_body}")
                         try:
@@ -136,7 +151,27 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                                 UpdateExpression='SET processed_discord = :val',
                                 ExpressionAttributeValues={':val': True}
                             )
+
+                            students_table.update_item(
+                                Key={'studentName': student_name},
+                                UpdateExpression='SET balance = :val',
+                                ExpressionAttributeValues={':val': Decimal(str(new_balance))}
+                            )
+
+                            now_utc = datetime.now(timezone.utc).isoformat()
+                            transaction_type = 'DEBIT'
+                            transaction_key = transaction_type + '#' + now_utc
+                            transactions_table.put_item(Item={
+                                'studentName': student_name,
+                                'transactionKey': transaction_key,
+                                'actionBy': 'mathpracs-student-payment-reminder',
+                                'amount': Decimal(str(total_amount_due)),
+                                'timestamp': now_utc,
+                                'transactionType': transaction_type
+                            })
+
                             count_discord_messages += 1
+                            count_transactions_recorded += 1
                         except Exception as e:
                             print(f"Failed to send Discord message: {e}")
 
@@ -148,7 +183,8 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                     'session_minutes': total_session_minutes,
                     'no_show_minutes': total_no_show_minutes,
                     'amount_due': total_amount_due,
-                    'discord_messages_sent': count_discord_messages
+                    'discord_messages_sent': count_discord_messages,
+                    'transactions_recorded': count_transactions_recorded
                 })
         
         return {
