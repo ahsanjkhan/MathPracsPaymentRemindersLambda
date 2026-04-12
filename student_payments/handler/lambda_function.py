@@ -56,7 +56,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             student_name = student_metadata.get('studentName')
             print(f"Processing student: {student_name}")
             students_table_item = students_table_mapped_by_student_name.get(student_name)
-            previous_balance = float(students_table_item.get('balance') or 0) if students_table_item else 0.0
+            previous_balance = round(float(students_table_item.get('balance') or 0), 2) if students_table_item else 0.0
 
             discord_channel_id = student_metadata.get('discordChannelReminderId')
             expected_session_name_for_student = student_metadata.get('studentName') + ' Tutoring'
@@ -76,41 +76,41 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                     total_no_show_minutes += minutes
             
             if total_no_show_minutes > 0:
-                total_no_show_hours = total_no_show_minutes / 60.0
+                total_no_show_hours = round(total_no_show_minutes / 60.0, 2)
 
             if expected_session_name_for_student in session_name_to_total_minutes:
                 total_session_minutes = session_name_to_total_minutes[expected_session_name_for_student]
-                total_session_hours = total_session_minutes / 60.0
+                total_session_hours = round(total_session_minutes / 60.0, 2)
 
             student_pricing_map = student_metadata.get('hourlyPricing')
 
             if student_pricing_map is not None:
                 if total_session_hours < 2:
-                    hourly_rate = float(student_pricing_map.get('1'))
+                    hourly_rate = round(float(student_pricing_map.get('1')), 2)
                 elif total_session_hours < 3:
-                    hourly_rate = float(student_pricing_map.get('2'))
+                    hourly_rate = round(float(student_pricing_map.get('2')), 2)
                 elif total_session_hours < 4:
-                    hourly_rate = float(student_pricing_map.get('3'))
+                    hourly_rate = round(float(student_pricing_map.get('3')), 2)
                 elif total_session_hours < 5:
-                    hourly_rate = float(student_pricing_map.get('4'))
+                    hourly_rate = round(float(student_pricing_map.get('4')), 2)
                 else:
-                    hourly_rate = float(student_pricing_map.get('5'))
+                    hourly_rate = round(float(student_pricing_map.get('5')), 2)
 
-                total_due_for_sessions = total_session_hours * hourly_rate
+                total_due_for_sessions = round(total_session_hours * hourly_rate, 2)
 
             if total_no_show_hours > 0:
-                no_show_rate = float(student_metadata.get('noShowCustomRate')) if student_metadata.get('noShowCustomRate') else hourly_rate * 0.5
-                total_due_for_no_shows = total_no_show_hours * no_show_rate
+                no_show_rate = round(float(student_metadata.get('noShowCustomRate')) if student_metadata.get('noShowCustomRate') else hourly_rate * 0.5, 2)
+                total_due_for_no_shows = round(total_no_show_hours * no_show_rate, 2)
 
             if total_due_for_sessions > 0 or total_due_for_no_shows > 0:
                 if total_due_for_sessions > 0 and total_due_for_no_shows > 0:
-                    calculation = f"({hourly_rate:.0f}\*{total_session_hours:.1f} for sessions + {no_show_rate:.0f}\*{total_no_show_hours:.1f} for no-shows)"
+                    calculation = f"({hourly_rate:.2f}\*{total_session_hours:.2f} for sessions + {no_show_rate:.2f}\*{total_no_show_hours:.2f} for no-shows)"
                 elif total_due_for_sessions > 0 and total_due_for_no_shows <= 0:
-                    calculation = f"({hourly_rate:.0f}\*{total_session_hours:.1f})"
+                    calculation = f"({hourly_rate:.2f}\*{total_session_hours:.2f})"
                 else:
-                    calculation = f"({no_show_rate:.0f}\*{total_no_show_hours:.1f} for no-shows)"
+                    calculation = f"({no_show_rate:.2f}\*{total_no_show_hours:.2f} for no-shows)"
 
-                total_amount_due = total_due_for_sessions + total_due_for_no_shows
+                total_amount_due = round(total_due_for_sessions + total_due_for_no_shows, 2)
                 
                 uid = f"{expected_session_name_for_student}#{week_start}#{week_end}"
 
@@ -134,7 +134,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                             'processed_discord': False
                         })
 
-                        new_balance = previous_balance + float(total_amount_due)
+                        new_balance = round(previous_balance + total_amount_due, 2)
 
                         message_body = (f"Hello, the amount due for {expected_session_name_for_student} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}.\n\n"
                                         f"Total balance: ${previous_balance:.2f} (previous balance) + ${total_amount_due:.2f} = ${new_balance:.2f}")
