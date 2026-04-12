@@ -55,16 +55,16 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
 
         for tutor in tutors_metadata:
             tutor_id = tutor.get('tutorId')
-            tutor_salary_rate = float(tutor.get('hourlyRate'))
+            tutor_salary_rate = round(float(tutor.get('hourlyRate')), 2)
             tutor_calendar_name = tutor.get('displayName')
             session_minutes = get_tutor_sessions_for_month(sessions, tutor_id, month_start, month_end, valid_event_names)
             no_show_minutes = get_tutor_no_shows_for_month(sessions, tutor_id, month_start, month_end, valid_event_names)
 
             if session_minutes > 0 or no_show_minutes > 0:
-                session_hours = session_minutes / MINUTES_PER_HOUR
-                no_show_hours = no_show_minutes / MINUTES_PER_HOUR
+                session_hours = round(session_minutes / MINUTES_PER_HOUR, 2)
+                no_show_hours = round(no_show_minutes / MINUTES_PER_HOUR, 2)
 
-                amount_due = (session_hours * tutor_salary_rate) + (no_show_hours * tutor_salary_rate)
+                amount_due = round((session_hours * tutor_salary_rate) + (no_show_hours * tutor_salary_rate), 2)
                 
                 uid = f"{tutor_calendar_name}#{month_start}#{month_end}"
                 
@@ -85,7 +85,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                             DYNAMODB_KEY_PROCESSED_DISCORD: False
                         })
                         
-                        message_body = f"The total payment for {tutor_calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} ({tutor_salary_rate}\*{session_hours:.1f} for sessions + 10.0\*{no_show_hours:.1f} for no-shows)."
+                        message_body = f"The total payment for {tutor_calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} ({tutor_salary_rate:.2f}\*{session_hours:.2f} for sessions + {tutor_salary_rate:.2f}\*{no_show_hours:.2f} for no-shows)."
                         
                         print(f"Sending Discord message: {message_body}")
                         try:
