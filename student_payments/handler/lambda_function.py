@@ -183,6 +183,54 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                     'discord_messages_sent': count_discord_messages,
                     'transactions_recorded': count_transactions_recorded
                 })
+
+            elif previous_balance > 0:
+                uid = f"{expected_session_name_for_student}#{week_start}#{week_end}"
+                count_discord_messages = 0
+
+                try:
+                    response = student_payment_reminders_table.get_item(Key={'uid': uid})
+                    if 'Item' in response and response['Item'].get('processed_discord'):
+                        continue
+                    else:
+                        student_payment_reminders_table.put_item(Item={
+                            'uid': uid,
+                            'event_name': expected_session_name_for_student,
+                            'week_start': week_start,
+                            'week_end': week_end,
+                            'session_minutes': 0,
+                            'no_show_minutes': 0,
+                            'amount_due': Decimal('0'),
+                            'processed_sms': False,
+                            'processed_discord': False
+                        })
+
+                        message_body = (f"Hello, please clear the outstanding balance for {expected_session_name_for_student} with MathPracs.\n\n"
+                                        f"Outstanding balance: ${previous_balance:.2f}")
+
+                        print(f"Sending Discord message: {message_body}")
+                        try:
+                            send_discord_message(discord_bot_token, discord_channel_id, message_body)
+                            student_payment_reminders_table.update_item(
+                                Key={'uid': uid},
+                                UpdateExpression='SET processed_discord = :val',
+                                ExpressionAttributeValues={':val': True}
+                            )
+                            count_discord_messages += 1
+                        except Exception as e:
+                            print(f"Failed to send Discord message: {e}")
+
+                except Exception as e:
+                    print(f"Error processing DDB update with uid: {uid}. Exception: {e}")
+
+                results.append({
+                    'event_name': expected_session_name_for_student,
+                    'session_minutes': 0,
+                    'no_show_minutes': 0,
+                    'amount_due': 0,
+                    'discord_messages_sent': count_discord_messages,
+                    'transactions_recorded': 0
+                })
         
         return {
             'statusCode': 200,
