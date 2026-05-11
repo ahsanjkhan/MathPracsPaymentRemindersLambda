@@ -57,6 +57,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             tutor_id = tutor.get('tutorId')
             tutor_salary_rate = round(float(tutor.get('hourlyRate')), 2)
             tutor_calendar_name = tutor.get('displayName')
+            tutor_payments_discord_channel_id = tutor.get(DYNAMODB_KEY_PAYMENTS_DISCORD_CHANNEL_ID)
             session_minutes = get_tutor_sessions_for_month(sessions, tutor_id, month_start, month_end, valid_event_names)
             no_show_minutes = get_tutor_no_shows_for_month(sessions, tutor_id, month_start, month_end, valid_event_names)
 
@@ -97,6 +98,12 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                             )
                         except Exception as e:
                             print(f"Failed to send Discord message: {e}")
+
+                        if tutor_payments_discord_channel_id:
+                            try:
+                                send_discord_message(discord_bot_token, tutor_payments_discord_channel_id, message_body)
+                            except Exception as e:
+                                print(f"Failed to send Discord message to tutor channel for {tutor_calendar_name}: {e}")
                 except Exception as e:
                     print(f"Error processing DDB update with uid: {uid}. Exception: {e}")
                 

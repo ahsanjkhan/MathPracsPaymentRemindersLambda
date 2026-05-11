@@ -36,6 +36,7 @@ DYNAMODB_KEY_AMOUNT_DUE = 'amount_due'
 DYNAMODB_KEY_PROCESSED_SMS = 'processed_sms'
 DYNAMODB_KEY_PROCESSED_DISCORD = 'processed_discord'
 DYNAMODB_KEY_ITEM = 'Item'
+DYNAMODB_KEY_PAYMENTS_DISCORD_CHANNEL_ID = 'paymentsDiscordChannelId'
 
 # Calendar API
 CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly'
