@@ -11,6 +11,25 @@ import boto3
 import httpx
 from aws_lambda_typing import context as lambda_context
 
+METRICS_NAMESPACE = "MathPracs/PaymentReminders"
+cloudwatch_client = boto3.client('cloudwatch')
+
+
+def emit_metric(metric_name: str, reason: str) -> None:
+    try:
+        cloudwatch_client.put_metric_data(
+            Namespace=METRICS_NAMESPACE,
+            MetricData=[{
+                'MetricName': metric_name,
+                'Dimensions': [{'Name': 'Reason', 'Value': reason}],
+                'Value': 1,
+                'Unit': 'Count'
+            }]
+        )
+    except Exception as e:
+        print(f"Failed to emit metric {metric_name}/{reason}: {e}")
+
+
 def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context: lambda_context.Context) -> Dict[str, Union[str, int]]:
     try:
         print(f"Received Event: {event}")
@@ -31,35 +50,66 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         students_table = dynamodb.Table(students_table_name)
         students_metadata_table = dynamodb.Table(students_metadata_table_name)
         transactions_table = dynamodb.Table(transactions_table_name)
-        
+
         week_start, week_end = get_previous_week_range()
         print(f"Processing week: {week_start} to {week_end}")
 
-        all_sessions = scan_all_items_from_db(sessions_table)
-        
+        try:
+            all_sessions = scan_all_items_from_db(sessions_table)
+        except Exception as e:
+            print(f"Failed to scan sessions table: {e}")
+            emit_metric("PaymentReminderDDB", "SessionsScanException")
+            raise
+
         session_name_to_total_minutes = get_last_week_sessions_to_minutes_mapping(all_sessions, week_start, week_end)
         print(f"Found {len(session_name_to_total_minutes)} unique session names in last week's sessions")
         print(f"Unique session names: {list(session_name_to_total_minutes.keys())}")
 
         student_payment_reminders_table = dynamodb.Table(student_payment_reminders_table_name)
 
-        students_metadata = scan_all_items_from_db(students_metadata_table)
-        students_table_mapped_by_student_name = {s['studentName']: s for s in scan_all_items_from_db(students_table)}
+        try:
+            students_metadata = scan_all_items_from_db(students_metadata_table)
+        except Exception as e:
+            print(f"Failed to scan students metadata table: {e}")
+            emit_metric("StudentInfoDDB", "MetadataScanException")
+            raise
+
+        try:
+            students_table_mapped_by_student_name = {s['studentName']: s for s in scan_all_items_from_db(students_table)}
+        except Exception as e:
+            print(f"Failed to scan students table: {e}")
+            emit_metric("StudentInfoDDB", "StudentsScanException")
+            raise
 
         secrets_client = boto3.client('secretsmanager')
         discord_secret_response = secrets_client.get_secret_value(SecretId=discord_secret_arn)
         discord_creds = json.loads(discord_secret_response['SecretString'])
         discord_bot_token = discord_creds['bot_token']
-        
+
         results = []
         for student_metadata in students_metadata:
             student_name = student_metadata.get('studentName')
+            if not student_name:
+                print("Student metadata missing studentName")
+                emit_metric("StudentInfoDDB", "MissingStudentName")
+                continue
+
             print(f"Processing student: {student_name}")
             students_table_item = students_table_mapped_by_student_name.get(student_name)
-            previous_balance = round(float(students_table_item.get('balance') or 0), 2) if students_table_item else 0.0
+            if not students_table_item:
+                print(f"Student not found: {student_name}")
+                emit_metric("StudentInfoDDB", "StudentNotFound")
+                continue
+
+            previous_balance = round(float(students_table_item.get('balance') or 0), 2)
 
             discord_channel_id = student_metadata.get('discordChannelReminderId')
-            expected_session_name_for_student = student_metadata.get('studentName') + ' Tutoring'
+            if not discord_channel_id:
+                print(f"Missing Discord reminder channel for student: {student_name}")
+                emit_metric("StudentInfoDDB", "MissingDiscordChannel")
+                continue
+
+            expected_session_name_for_student = student_name + ' Tutoring'
             hourly_rate = 0
 
             total_session_minutes = 0
@@ -74,7 +124,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             for session_name, minutes in session_name_to_total_minutes.items():
                 if is_no_show_event(expected_session_name_for_student, session_name):
                     total_no_show_minutes += minutes
-            
+
             if total_no_show_minutes > 0:
                 total_no_show_hours = round(total_no_show_minutes / 60.0, 2)
 
@@ -85,20 +135,33 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
             student_pricing_map = student_metadata.get('hourlyPricing')
 
             if student_pricing_map is not None:
-                if total_session_hours < 2:
-                    hourly_rate = round(float(student_pricing_map.get('1')), 2)
-                elif total_session_hours < 3:
-                    hourly_rate = round(float(student_pricing_map.get('2')), 2)
-                elif total_session_hours < 4:
-                    hourly_rate = round(float(student_pricing_map.get('3')), 2)
-                elif total_session_hours < 5:
-                    hourly_rate = round(float(student_pricing_map.get('4')), 2)
-                else:
-                    hourly_rate = round(float(student_pricing_map.get('5')), 2)
+                try:
+                    if total_session_hours < 2:
+                        hourly_rate = round(float(student_pricing_map.get('1')), 2)
+                    elif total_session_hours < 3:
+                        hourly_rate = round(float(student_pricing_map.get('2')), 2)
+                    elif total_session_hours < 4:
+                        hourly_rate = round(float(student_pricing_map.get('3')), 2)
+                    elif total_session_hours < 5:
+                        hourly_rate = round(float(student_pricing_map.get('4')), 2)
+                    else:
+                        hourly_rate = round(float(student_pricing_map.get('5')), 2)
+                except (TypeError, ValueError) as e:
+                    print(f"Invalid hourly pricing for student {student_name}: {e}")
+                    emit_metric("StudentInfoDDB", "InvalidHourlyPricing")
+                    continue
 
                 total_due_for_sessions = round(total_session_hours * hourly_rate, 2)
+            elif total_session_hours > 0:
+                print(f"Missing hourly pricing for student {student_name}")
+                emit_metric("StudentInfoDDB", "MissingHourlyPricing")
+                continue
 
             if total_no_show_hours > 0:
+                if hourly_rate == 0 and not student_metadata.get('noShowCustomRate'):
+                    print(f"Missing no-show pricing for student {student_name}")
+                    emit_metric("StudentInfoDDB", "MissingNoShowPricing")
+                    continue
                 no_show_rate = round(float(student_metadata.get('noShowCustomRate')) if student_metadata.get('noShowCustomRate') else hourly_rate * 0.5, 2)
                 total_due_for_no_shows = round(total_no_show_hours * no_show_rate, 2)
 
@@ -111,70 +174,92 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                     calculation = f"({no_show_rate:.2f}\*{total_no_show_hours:.2f} for no-shows)"
 
                 total_amount_due = round(total_due_for_sessions + total_due_for_no_shows, 2)
-                
+
                 uid = f"{expected_session_name_for_student}#{week_start}#{week_end}"
 
                 count_discord_messages = 0
                 count_transactions_recorded = 0
-                
+
                 try:
                     response = student_payment_reminders_table.get_item(Key={'uid': uid})
-                    if 'Item' in response and response['Item'].get('processed_discord'):
-                        continue
-                    else:
-                        student_payment_reminders_table.put_item(Item={
-                            'uid': uid,
-                            'event_name': expected_session_name_for_student,
-                            'week_start': week_start,
-                            'week_end': week_end,
-                            'session_minutes': total_session_minutes,
-                            'no_show_minutes': total_no_show_minutes,
-                            'amount_due': Decimal(str(total_amount_due)),
-                            'processed_sms': False,
-                            'processed_discord': False
-                        })
-
-                        new_balance = round(previous_balance + total_amount_due, 2)
-
-                        message_body = (f"Hello, the amount due for {expected_session_name_for_student} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}.\n\n"
-                                        f"Total balance: ${previous_balance:.2f} (previous balance) + ${total_amount_due:.2f} = ${new_balance:.2f}")
-
-
-                        print(f"Sending Discord message: {message_body}")
-                        try:
-                            send_discord_message(discord_bot_token, discord_channel_id, message_body)
-                            student_payment_reminders_table.update_item(
-                                Key={'uid': uid},
-                                UpdateExpression='SET processed_discord = :val',
-                                ExpressionAttributeValues={':val': True}
-                            )
-
-                            students_table.update_item(
-                                Key={'studentName': student_name},
-                                UpdateExpression='SET balance = :val',
-                                ExpressionAttributeValues={':val': Decimal(str(new_balance))}
-                            )
-
-                            now_utc = datetime.now(timezone.utc).isoformat()
-                            transaction_type = 'DEBIT'
-                            transaction_key = transaction_type + '#' + now_utc
-                            transactions_table.put_item(Item={
-                                'studentName': student_name,
-                                'transactionKey': transaction_key,
-                                'actionBy': 'mathpracs-student-payment-reminder',
-                                'amount': Decimal(str(total_amount_due)),
-                                'timestamp': now_utc,
-                                'transactionType': transaction_type
-                            })
-
-                            count_discord_messages += 1
-                            count_transactions_recorded += 1
-                        except Exception as e:
-                            print(f"Failed to send Discord message: {e}")
-
                 except Exception as e:
-                    print(f"Error processing DDB update with uid: {uid}. Exception: {e}")
-                
+                    print(f"Error getting payment reminder with uid: {uid}. Exception: {e}")
+                    emit_metric("PaymentReminderDDB", "GetReminderException")
+                    continue
+
+                if 'Item' in response and response['Item'].get('processed_discord'):
+                    continue
+
+                try:
+                    student_payment_reminders_table.put_item(Item={
+                        'uid': uid,
+                        'event_name': expected_session_name_for_student,
+                        'week_start': week_start,
+                        'week_end': week_end,
+                        'session_minutes': total_session_minutes,
+                        'no_show_minutes': total_no_show_minutes,
+                        'amount_due': Decimal(str(total_amount_due)),
+                        'processed_sms': False,
+                        'processed_discord': False
+                    })
+                except Exception as e:
+                    print(f"Error putting payment reminder with uid: {uid}. Exception: {e}")
+                    emit_metric("PaymentReminderDDB", "PutReminderException")
+                    continue
+
+                new_balance = round(previous_balance + total_amount_due, 2)
+
+                message_body = (f"Hello, the amount due for {expected_session_name_for_student} with MathPracs for last week ({week_start} to {week_end}) is ${total_amount_due:.2f} {calculation}.\n\n"
+                                f"Total balance: ${previous_balance:.2f} (previous balance) + ${total_amount_due:.2f} = ${new_balance:.2f}")
+
+                print(f"Sending Discord message: {message_body}")
+                try:
+                    send_discord_message(discord_bot_token, discord_channel_id, message_body)
+                    count_discord_messages += 1
+                except Exception as e:
+                    print(f"Failed to send Discord message: {e}")
+                    emit_metric("APIFailure", "DiscordSendFailed")
+                    continue
+
+                try:
+                    student_payment_reminders_table.update_item(
+                        Key={'uid': uid},
+                        UpdateExpression='SET processed_discord = :val',
+                        ExpressionAttributeValues={':val': True}
+                    )
+                except Exception as e:
+                    print(f"Failed to update processed_discord for uid {uid}: {e}")
+                    emit_metric("PaymentReminderDDB", "UpdateProcessedDiscordException")
+                    continue
+
+                try:
+                    students_table.update_item(
+                        Key={'studentName': student_name},
+                        UpdateExpression='SET balance = :val',
+                        ExpressionAttributeValues={':val': Decimal(str(new_balance))}
+                    )
+                except Exception as e:
+                    print(f"Failed to update balance for student {student_name}: {e}")
+                    emit_metric("StudentInfoDDB", "BalanceUpdateException")
+                    continue
+
+                try:
+                    now_utc = datetime.now(timezone.utc).isoformat()
+                    transaction_type = 'DEBIT'
+                    transaction_key = transaction_type + '#' + now_utc
+                    transactions_table.put_item(Item={
+                        'studentName': student_name,
+                        'transactionKey': transaction_key,
+                        'actionBy': 'mathpracs-student-payment-reminder',
+                        'amount': Decimal(str(total_amount_due)),
+                        'timestamp': now_utc,
+                        'transactionType': transaction_type
+                    })
+                    count_transactions_recorded += 1
+                except Exception as e:
+                    print(f"Failed to record transaction for student {student_name}: {e}")
+                    emit_metric("TransactionsDDB", "PutTransactionException")
+
                 results.append({
                     'event_name': expected_session_name_for_student,
                     'session_minutes': total_session_minutes,
@@ -190,38 +275,53 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
 
                 try:
                     response = student_payment_reminders_table.get_item(Key={'uid': uid})
-                    if 'Item' in response and response['Item'].get('processed_discord'):
-                        continue
-                    else:
-                        student_payment_reminders_table.put_item(Item={
-                            'uid': uid,
-                            'event_name': expected_session_name_for_student,
-                            'week_start': week_start,
-                            'week_end': week_end,
-                            'session_minutes': 0,
-                            'no_show_minutes': 0,
-                            'amount_due': Decimal('0'),
-                            'processed_sms': False,
-                            'processed_discord': False
-                        })
-
-                        message_body = (f"Hello, please clear the outstanding balance for {expected_session_name_for_student} with MathPracs.\n\n"
-                                        f"Outstanding balance: ${previous_balance:.2f}")
-
-                        print(f"Sending Discord message: {message_body}")
-                        try:
-                            send_discord_message(discord_bot_token, discord_channel_id, message_body)
-                            student_payment_reminders_table.update_item(
-                                Key={'uid': uid},
-                                UpdateExpression='SET processed_discord = :val',
-                                ExpressionAttributeValues={':val': True}
-                            )
-                            count_discord_messages += 1
-                        except Exception as e:
-                            print(f"Failed to send Discord message: {e}")
-
                 except Exception as e:
-                    print(f"Error processing DDB update with uid: {uid}. Exception: {e}")
+                    print(f"Error getting payment reminder with uid: {uid}. Exception: {e}")
+                    emit_metric("PaymentReminderDDB", "GetReminderException")
+                    continue
+
+                if 'Item' in response and response['Item'].get('processed_discord'):
+                    continue
+
+                try:
+                    student_payment_reminders_table.put_item(Item={
+                        'uid': uid,
+                        'event_name': expected_session_name_for_student,
+                        'week_start': week_start,
+                        'week_end': week_end,
+                        'session_minutes': 0,
+                        'no_show_minutes': 0,
+                        'amount_due': Decimal('0'),
+                        'processed_sms': False,
+                        'processed_discord': False
+                    })
+                except Exception as e:
+                    print(f"Error putting payment reminder with uid: {uid}. Exception: {e}")
+                    emit_metric("PaymentReminderDDB", "PutReminderException")
+                    continue
+
+                message_body = (f"Hello, please clear the outstanding balance for {expected_session_name_for_student} with MathPracs.\n\n"
+                                f"Outstanding balance: ${previous_balance:.2f}")
+
+                print(f"Sending Discord message: {message_body}")
+                try:
+                    send_discord_message(discord_bot_token, discord_channel_id, message_body)
+                    count_discord_messages += 1
+                except Exception as e:
+                    print(f"Failed to send Discord message: {e}")
+                    emit_metric("APIFailure", "DiscordSendFailed")
+                    continue
+
+                try:
+                    student_payment_reminders_table.update_item(
+                        Key={'uid': uid},
+                        UpdateExpression='SET processed_discord = :val',
+                        ExpressionAttributeValues={':val': True}
+                    )
+                except Exception as e:
+                    print(f"Failed to update processed_discord for uid {uid}: {e}")
+                    emit_metric("PaymentReminderDDB", "UpdateProcessedDiscordException")
+                    continue
 
                 results.append({
                     'event_name': expected_session_name_for_student,
@@ -231,7 +331,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                     'discord_messages_sent': count_discord_messages,
                     'transactions_recorded': 0
                 })
-        
+
         return {
             'statusCode': 200,
             'body': json.dumps({
@@ -239,8 +339,10 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 'results': results
             })
         }
-        
+
     except Exception as e:
+        print(f"Error: {str(e)}")
+        emit_metric("UnknownFailures", "UnhandledException")
         return {
             'statusCode': 500,
             'body': json.dumps({'error': str(e)})
@@ -262,7 +364,7 @@ def get_previous_week_range() -> Tuple[str, str]:
     days_since_sunday = (today.weekday() + 1) % 7
     last_sunday = today - timedelta(days=days_since_sunday + 7)
     last_saturday = last_sunday + timedelta(days=6)
-    
+
     return last_sunday.strftime('%Y-%m-%d'), last_saturday.strftime('%Y-%m-%d')
 
 def get_last_week_sessions_to_minutes_mapping(sessions: List[Dict], start_date: str, end_date: str) -> Dict[str, int]:
@@ -297,7 +399,7 @@ def is_no_show_event(standard_session_name: str, session_name: str) -> bool:
     """
     normalized_session = re.sub(r'[^\w\s]', '', session_name.lower())
     normalized_base = re.sub(r'[^\w\s]', '', standard_session_name.lower())
-    
+
     no_show_pattern = rf'^{re.escape(normalized_base)}\s+no\s*show'
     return bool(re.search(no_show_pattern, normalized_session))
 
