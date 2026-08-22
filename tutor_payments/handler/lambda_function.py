@@ -13,6 +13,24 @@ from aws_lambda_typing import context as lambda_context
 
 from .constants import *
 
+METRICS_NAMESPACE = "MathPracs/PaymentReminders"
+cloudwatch_client = boto3.client('cloudwatch')
+
+
+def emit_metric(metric_name: str, reason: str) -> None:
+    try:
+        cloudwatch_client.put_metric_data(
+            Namespace=METRICS_NAMESPACE,
+            MetricData=[{
+                'MetricName': metric_name,
+                'Dimensions': [{'Name': 'Reason', 'Value': reason}],
+                'Value': 1,
+                'Unit': 'Count'
+            }]
+        )
+    except Exception as e:
+        print(f"Failed to emit metric {metric_name}/{reason}: {e}")
+
 
 def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context: lambda_context.Context) -> Dict[str, Union[str, int]]:
     try:
@@ -38,8 +56,19 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
 
         month_start, month_end = get_previous_month_range()
 
-        valid_event_names = {(student.get('studentName') + ' Tutoring') for student in scan_all_items_from_db(students_metadata_table)}
-        sessions = scan_all_items_from_db(sessions_table)
+        try:
+            valid_event_names = {(student.get('studentName') + ' Tutoring') for student in scan_all_items_from_db(students_metadata_table) if student.get('studentName')}
+        except Exception as e:
+            print(f"Failed to scan students metadata table: {e}")
+            emit_metric("StudentInfoDDB", "MetadataScanException")
+            raise
+
+        try:
+            sessions = scan_all_items_from_db(sessions_table)
+        except Exception as e:
+            print(f"Failed to scan sessions table: {e}")
+            emit_metric("PaymentReminderDDB", "SessionsScanException")
+            raise
 
         tutor_payment_reminders_table = dynamodb.Table(tutors_payment_reminders_table_name)
 
@@ -51,13 +80,39 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
 
         results = []
 
-        tutors_metadata = scan_all_items_from_db(tutors_metadata_table)
+        try:
+            tutors_metadata = scan_all_items_from_db(tutors_metadata_table)
+        except Exception as e:
+            print(f"Failed to scan tutors metadata table: {e}")
+            emit_metric("TutorInfoDDB", "MetadataScanException")
+            raise
 
         for tutor in tutors_metadata:
             tutor_id = tutor.get('tutorId')
-            tutor_salary_rate = round(float(tutor.get('hourlyRate')), 2)
+            if not tutor_id:
+                print("Tutor metadata missing tutorId")
+                emit_metric("TutorInfoDDB", "MissingTutorId")
+                continue
+
+            try:
+                tutor_salary_rate = round(float(tutor.get('hourlyRate')), 2)
+            except (TypeError, ValueError) as e:
+                print(f"Invalid hourly rate for tutor {tutor_id}: {e}")
+                emit_metric("TutorInfoDDB", "InvalidHourlyRate")
+                continue
+
             tutor_calendar_name = tutor.get('displayName')
+            if not tutor_calendar_name:
+                print(f"Missing displayName for tutor {tutor_id}")
+                emit_metric("TutorInfoDDB", "MissingDisplayName")
+                continue
+
             tutor_payments_discord_channel_id = tutor.get(DYNAMODB_KEY_PAYMENTS_DISCORD_CHANNEL_ID)
+            if not tutor_payments_discord_channel_id:
+                print(f"Missing payments Discord channel for tutor {tutor_id}")
+                emit_metric("TutorInfoDDB", "MissingTutorPaymentChannel")
+                continue
+
             session_minutes = get_tutor_sessions_for_month(sessions, tutor_id, month_start, month_end, valid_event_names)
             no_show_minutes = get_tutor_no_shows_for_month(sessions, tutor_id, month_start, month_end, valid_event_names)
 
@@ -66,54 +121,70 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 no_show_hours = round(no_show_minutes / MINUTES_PER_HOUR, 2)
 
                 amount_due = round((session_hours * tutor_salary_rate) + (no_show_hours * tutor_salary_rate), 2)
-                
+
                 uid = f"{tutor_calendar_name}#{month_start}#{month_end}"
-                
+
                 try:
                     response = tutor_payment_reminders_table.get_item(Key={DYNAMODB_KEY_UID: uid})
-                    if DYNAMODB_KEY_ITEM in response and response[DYNAMODB_KEY_ITEM].get(DYNAMODB_KEY_PROCESSED_DISCORD):
-                        continue
-                    else:
-                        tutor_payment_reminders_table.put_item(Item={
-                            DYNAMODB_KEY_UID: uid,
-                            DYNAMODB_KEY_CALENDAR_NAME: tutor_calendar_name,
-                            DYNAMODB_KEY_MONTH_START: month_start,
-                            DYNAMODB_KEY_MONTH_END: month_end,
-                            DYNAMODB_KEY_SESSION_MINUTES: session_minutes,
-                            DYNAMODB_KEY_NO_SHOW_MINUTES: no_show_minutes,
-                            DYNAMODB_KEY_AMOUNT_DUE: Decimal(str(amount_due)),
-                            DYNAMODB_KEY_PROCESSED_SMS: False,
-                            DYNAMODB_KEY_PROCESSED_DISCORD: False
-                        })
-                        
-                        message_body = f"The total payment for {tutor_calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} ({tutor_salary_rate:.2f}\*{session_hours:.2f} for sessions + {tutor_salary_rate:.2f}\*{no_show_hours:.2f} for no-shows)."
-                        
-                        print(f"Sending Discord message: {message_body}")
-                        try:
-                            send_discord_message(discord_bot_token, discord_channel_id, message_body)
-                            tutor_payment_reminders_table.update_item(
-                                Key={DYNAMODB_KEY_UID: uid},
-                                UpdateExpression=DYNAMODB_UPDATE_EXPRESSION,
-                                ExpressionAttributeValues={':val': True}
-                            )
-                        except Exception as e:
-                            print(f"Failed to send Discord message: {e}")
-
-                        if tutor_payments_discord_channel_id:
-                            try:
-                                send_discord_message(discord_bot_token, tutor_payments_discord_channel_id, message_body)
-                            except Exception as e:
-                                print(f"Failed to send Discord message to tutor channel for {tutor_calendar_name}: {e}")
                 except Exception as e:
-                    print(f"Error processing DDB update with uid: {uid}. Exception: {e}")
-                
+                    print(f"Error getting tutor payment reminder with uid: {uid}. Exception: {e}")
+                    emit_metric("PaymentReminderDDB", "GetReminderException")
+                    continue
+
+                if DYNAMODB_KEY_ITEM in response and response[DYNAMODB_KEY_ITEM].get(DYNAMODB_KEY_PROCESSED_DISCORD):
+                    continue
+
+                try:
+                    tutor_payment_reminders_table.put_item(Item={
+                        DYNAMODB_KEY_UID: uid,
+                        DYNAMODB_KEY_CALENDAR_NAME: tutor_calendar_name,
+                        DYNAMODB_KEY_MONTH_START: month_start,
+                        DYNAMODB_KEY_MONTH_END: month_end,
+                        DYNAMODB_KEY_SESSION_MINUTES: session_minutes,
+                        DYNAMODB_KEY_NO_SHOW_MINUTES: no_show_minutes,
+                        DYNAMODB_KEY_AMOUNT_DUE: Decimal(str(amount_due)),
+                        DYNAMODB_KEY_PROCESSED_SMS: False,
+                        DYNAMODB_KEY_PROCESSED_DISCORD: False
+                    })
+                except Exception as e:
+                    print(f"Error putting tutor payment reminder with uid: {uid}. Exception: {e}")
+                    emit_metric("PaymentReminderDDB", "PutReminderException")
+                    continue
+
+                message_body = f"The total payment for {tutor_calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} ({tutor_salary_rate:.2f}\*{session_hours:.2f} for sessions + {tutor_salary_rate:.2f}\*{no_show_hours:.2f} for no-shows)."
+
+                print(f"Sending Discord message: {message_body}")
+                try:
+                    send_discord_message(discord_bot_token, discord_channel_id, message_body)
+                except Exception as e:
+                    print(f"Failed to send Discord message: {e}")
+                    emit_metric("APIFailure", "DiscordSendFailed")
+                    continue
+
+                try:
+                    tutor_payment_reminders_table.update_item(
+                        Key={DYNAMODB_KEY_UID: uid},
+                        UpdateExpression=DYNAMODB_UPDATE_EXPRESSION,
+                        ExpressionAttributeValues={':val': True}
+                    )
+                except Exception as e:
+                    print(f"Failed to update processed_discord for uid {uid}: {e}")
+                    emit_metric("PaymentReminderDDB", "UpdateProcessedDiscordException")
+                    continue
+
+                try:
+                    send_discord_message(discord_bot_token, tutor_payments_discord_channel_id, message_body)
+                except Exception as e:
+                    print(f"Failed to send Discord message to tutor channel for {tutor_calendar_name}: {e}")
+                    emit_metric("APIFailure", "TutorDiscordSendFailed")
+
                 results.append({
                     DYNAMODB_KEY_CALENDAR_NAME: tutor_calendar_name,
                     DYNAMODB_KEY_SESSION_MINUTES: session_minutes,
                     DYNAMODB_KEY_NO_SHOW_MINUTES: no_show_minutes,
                     DYNAMODB_KEY_AMOUNT_DUE: amount_due
                 })
-        
+
         return {
             'statusCode': HTTP_STATUS_OK,
             'body': json.dumps({
@@ -121,8 +192,10 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 RESPONSE_KEY_RESULTS: results
             })
         }
-        
+
     except Exception as e:
+        print(f"Error: {str(e)}")
+        emit_metric("UnknownFailures", "UnhandledException")
         return {
             'statusCode': HTTP_STATUS_ERROR,
             'body': json.dumps({RESPONSE_KEY_ERROR: str(e)})
@@ -144,7 +217,7 @@ def get_previous_month_range() -> Tuple[str, str]:
     first_of_this_month = today.replace(day=1)
     last_of_previous_month = first_of_this_month - timedelta(days=1)
     first_of_previous_month = last_of_previous_month.replace(day=1)
-    
+
     return first_of_previous_month.strftime(DATE_FORMAT), last_of_previous_month.strftime(DATE_FORMAT)
 
 def get_tutor_no_shows_for_month(sessions: List[Dict], tutor_id: str, start_date: str, end_date: str, valid_event_names: set) -> int:
@@ -211,7 +284,7 @@ def is_no_show_event(event_name: str, calendar_event_name: str) -> bool:
     """
     normalized_event = re.sub(r'[^\w\s]', '', calendar_event_name.lower())
     normalized_base = re.sub(r'[^\w\s]', '', event_name.lower())
-    
+
     no_show_pattern = rf'^{re.escape(normalized_base)}\s+no\s*show'
     return bool(re.search(no_show_pattern, normalized_event))
 
@@ -222,16 +295,16 @@ def is_valid_session_event(calendar_event_name: str, valid_event_names: set) -> 
     calendar_event_name: "Joe Tutoring" or "Joe Tutoring Demo" etc.
     """
     normalized_event = re.sub(r'[^\w\s]', '', calendar_event_name.lower())
-    
+
     # Remove 'demo' suffix if present for matching
     normalized_event_base = re.sub(r'\s+demo$', '', normalized_event).strip()
-    
+
     # Check if matches any valid event name (case-insensitive)
     for valid_name in valid_event_names:
         normalized_valid = re.sub(r'[^\w\s]', '', valid_name.lower())
         if normalized_event == normalized_valid or normalized_event_base == normalized_valid:
             return True
-    
+
     return False
 
 def scan_all_items_from_db(table) -> List[Dict]:
