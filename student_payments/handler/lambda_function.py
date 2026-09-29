@@ -235,8 +235,8 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 try:
                     students_table.update_item(
                         Key={'studentName': student_name},
-                        UpdateExpression='SET balance = :val',
-                        ExpressionAttributeValues={':val': Decimal(str(new_balance))}
+                        UpdateExpression='ADD balance :amount',
+                        ExpressionAttributeValues={':amount': Decimal(str(total_amount_due))}
                     )
                 except Exception as e:
                     print(f"Failed to update balance for student {student_name}: {e}")
