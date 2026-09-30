@@ -109,7 +109,20 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 emit_metric("TutorInfoDDB", "MissingDisplayName")
                 continue
 
-            tutor_payments_discord_channel_id = tutor.get(DYNAMODB_KEY_PAYMENTS_DISCORD_CHANNEL_ID)
+            try:
+                tutor_response = tutors_table.get_item(Key={DYNAMODB_KEY_TUTOR_ID: tutor_id})
+                if DYNAMODB_KEY_ITEM not in tutor_response:
+                    print(f"Tutor not found: {tutor_id}")
+                    emit_metric("TutorInfoDDB", "TutorNotFound")
+                    continue
+
+                tutors_table_item = tutor_response[DYNAMODB_KEY_ITEM]
+            except Exception as e:
+                print(f"Error fetching tutor {tutor_id}: {e}")
+                emit_metric("TutorInfoDDB", "FetchException")
+                continue
+
+            tutor_payments_discord_channel_id = tutors_table_item.get(DYNAMODB_KEY_PAYMENTS_DISCORD_CHANNEL_ID)
             if not tutor_payments_discord_channel_id:
                 print(f"Missing payments Discord channel for tutor {tutor_id}")
                 emit_metric("TutorInfoDDB", "MissingTutorPaymentChannel")
