@@ -11,6 +11,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 DISCORD_API_BASE = "https://discord.com/api/v10"
 STUDENT_LOG_GROUP = "/aws/lambda/mathpracs-student-payment-reminder"
 TUTOR_LOG_GROUP = "/aws/lambda/mathpracs-tutor-payment-reminder"
+BUSINESS_LOG_GROUP = "/aws/lambda/mathpracs-business-payment-reminder"
 REGION = "us-east-1"
 
 
@@ -31,13 +32,15 @@ def lambda_handler(event, context):
         alarm_url = build_alarm_url(alarm_name)
         student_logs_url = build_logs_url(STUDENT_LOG_GROUP, timestamp)
         tutor_logs_url = build_logs_url(TUTOR_LOG_GROUP, timestamp)
+        business_logs_url = build_logs_url(BUSINESS_LOG_GROUP, timestamp)
 
         notification = (
             f"🚨 **PaymentReminders Alarm: {alarm_name}**\n"
             f"Time: {timestamp}\n\n"
             f"🔍 Alarm: {alarm_url}\n"
             f"📋 Student Logs: {student_logs_url}\n"
-            f"📋 Tutor Logs: {tutor_logs_url}"
+            f"📋 Tutor Logs: {tutor_logs_url}\n"
+            f"📋 Business Logs: {business_logs_url}"
         )
 
         send_discord_message(bot_token, channel_id, notification)

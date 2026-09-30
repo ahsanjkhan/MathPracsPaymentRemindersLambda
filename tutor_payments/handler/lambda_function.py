@@ -44,6 +44,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         students_metadata_table_name = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_STUDENTS_METADATA_TABLE_NAME)
         tutors_table_name = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_TUTORS_TABLE_NAME)
         tutors_metadata_table_name = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_TUTORS_METADATA_TABLE_NAME)
+        tutor_transactions_table_name = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_TUTOR_TRANSACTIONS_TABLE_NAME)
         discord_secret_arn = os.environ.get(IMPORTED_TUTOR_PAYMENT_LAMBDA_ENV_VAR_KEY_DISCORD_API_SECRETS_ARN)
 
         # Cross stack tables
@@ -53,6 +54,7 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
         students_metadata_table = dynamodb.Table(students_metadata_table_name)
         tutors_table = dynamodb.Table(tutors_table_name)
         tutors_metadata_table = dynamodb.Table(tutors_metadata_table_name)
+        tutor_transactions_table = dynamodb.Table(tutor_transactions_table_name)
 
         month_start, month_end = get_previous_month_range()
 
@@ -177,6 +179,33 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                 except Exception as e:
                     print(f"Failed to send Discord message to tutor channel for {tutor_calendar_name}: {e}")
                     emit_metric("APIFailure", "TutorDiscordSendFailed")
+
+                try:
+                    tutors_table.update_item(
+                        Key={DYNAMODB_KEY_TUTOR_ID: tutor_id},
+                        UpdateExpression=DYNAMODB_ADD_BALANCE_UPDATE_EXPRESSION,
+                        ExpressionAttributeValues={':amount': Decimal(str(-amount_due))}
+                    )
+                except Exception as e:
+                    print(f"Failed to update balance for tutor {tutor_id}: {e}")
+                    emit_metric("TutorInfoDDB", "BalanceUpdateException")
+                    continue
+
+                try:
+                    now_utc = datetime.now(timezone.utc).isoformat()
+                    transaction_type = TRANSACTION_TYPE_CREDIT
+                    transaction_key = transaction_type + '#' + now_utc
+                    tutor_transactions_table.put_item(Item={
+                        DYNAMODB_KEY_TUTOR_ID: tutor_id,
+                        DYNAMODB_KEY_TRANSACTION_KEY: transaction_key,
+                        DYNAMODB_KEY_ACTION_BY: TUTOR_PAYMENT_ACTION_BY,
+                        DYNAMODB_KEY_AMOUNT: Decimal(str(amount_due)),
+                        DYNAMODB_KEY_TIMESTAMP: now_utc,
+                        DYNAMODB_KEY_TRANSACTION_TYPE: transaction_type
+                    })
+                except Exception as e:
+                    print(f"Failed to record transaction for tutor {tutor_id}: {e}")
+                    emit_metric("TutorTransactionsDDB", "PutTutorTransactionException")
 
                 results.append({
                     DYNAMODB_KEY_CALENDAR_NAME: tutor_calendar_name,
