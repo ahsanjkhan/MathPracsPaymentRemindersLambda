@@ -1,0 +1,67 @@
+# Cross-stack environment variable keys
+IMPORTED_MUAZ_ONLY_ADJUSTMENT_LAMBDA_ENV_VAR_KEY_TRANSACTIONS_TABLE_NAME = 'TRANSACTIONS_TABLE_NAME'
+IMPORTED_MUAZ_ONLY_ADJUSTMENT_LAMBDA_ENV_VAR_KEY_SESSIONS_TABLE_NAME = 'SESSIONS_TABLE_NAME'
+IMPORTED_MUAZ_ONLY_ADJUSTMENT_LAMBDA_ENV_VAR_KEY_TUTORS_METADATA_TABLE_NAME = 'TUTORS_METADATA_TABLE_NAME'
+IMPORTED_MUAZ_ONLY_ADJUSTMENT_LAMBDA_ENV_VAR_KEY_DISCORD_API_SECRETS_ARN = 'IMPORTED_DISCORD_API_SECRETS_ARN'
+
+# Secrets Manager keys
+SECRET_KEY_DISCORD_BOT_TOKEN = 'bot_token'
+SECRET_KEY_PAYMENT_REMINDERS_CHANNEL_ID = 'payment_reminders_channel_id'
+
+# DynamoDB keys
+DYNAMODB_KEY_ITEM = 'Item'
+DYNAMODB_KEY_STUDENT_NAME = 'studentName'
+DYNAMODB_KEY_ACTION_BY = 'actionBy'
+DYNAMODB_KEY_AMOUNT = 'amount'
+DYNAMODB_KEY_TIMESTAMP = 'timestamp'
+DYNAMODB_KEY_TRANSACTION_TYPE = 'transactionType'
+DYNAMODB_KEY_TUTOR_ID = 'tutorId'
+DYNAMODB_KEY_HOURLY_RATE = 'hourlyRate'
+DYNAMODB_KEY_SUMMARY = 'summary'
+DYNAMODB_KEY_UTC_START = 'utcStart'
+DYNAMODB_KEY_UTC_END = 'utcEnd'
+
+# Muaz-only students
+MUAZ_ONLY_STUDENTS = ('Felix', 'Jay', 'Ana', 'Gabe')
+
+# Transactions
+TRANSACTION_TYPE_CREDIT = 'CREDIT'
+
+# Partners
+PARTNER_AHSAN = 'ahsan'
+PARTNER_MUAZ = 'muaz'
+PARTNERS = (PARTNER_AHSAN, PARTNER_MUAZ)
+PARTNER_SPLIT = 0.5
+
+# Sessions
+SESSION_NAME_SUFFIX = ' Tutoring'
+SECONDS_PER_HOUR = 3600.0
+
+# Message
+OFF_THE_BOOKS_NOTICE = 'Do NOT record this payment using discord commands after it is sent/received. It is to be handled outside of the MathPracs Payment System'
+
+# Go-live date
+GO_LIVE_DATE = '2026-09-13'
+
+# Timezone
+TIMEZONE_CHICAGO = 'America/Chicago'
+
+# Date format
+DATE_FORMAT = '%Y-%m-%d'
+
+# AWS service names
+AWS_SERVICE_DYNAMODB = 'dynamodb'
+AWS_SERVICE_SECRETSMANAGER = 'secretsmanager'
+
+# Response messages
+RESPONSE_MESSAGE_SUCCESS = 'MathPracs Muaz-only Adjustment executed successfully'
+RESPONSE_MESSAGE_NOTHING_TO_REPORT = 'MathPracs Muaz-only Adjustment had nothing to report'
+RESPONSE_KEY_MESSAGE = 'message'
+RESPONSE_KEY_RESULTS = 'results'
+RESPONSE_KEY_ERROR = 'error'
+RESPONSE_KEY_SUBTOTAL = 'subtotal'
+RESPONSE_KEY_AHSAN_SENDS_MUAZ = 'ahsan_sends_muaz'
+
+# HTTP status codes
+HTTP_STATUS_OK = 200
+HTTP_STATUS_ERROR = 500
