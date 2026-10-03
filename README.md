@@ -20,7 +20,7 @@ The Muaz-only adjustments are invoked every 1st of the Month at 2:00 PM (Timezon
 
 Once the total due is calculated per student/tutor, it stores the result in a DynamoDB Table.
 
-The tutor payment reminders also record each tutor's monthly earnings as a CREDIT in the TutorTransactions DynamoDB Table and lower the tutor's balance in the TutorsV2 DynamoDB Table.
+The tutor payment reminders also record each tutor's monthly earnings as a CREDIT in the TutorTransactions DynamoDB Table and lower the tutor's balance in the TutorsV2 DynamoDB Table. The tutor payment reminder message shows the total owed to the tutor, which is the previous balance (negative when the tutor was paid in advance) plus this month's earnings.
 
 The business payment reminders add up, for the previous month (starting 2026-09-13), the student payments collected by Ahsan and by Muaz (Transactions DynamoDB Table) and the tutor payments each of them sent (TutorTransactions DynamoDB Table). Each partner owes the other half of what they collected, and is owed half of what they paid tutors. The net amount is recorded as a DEBIT in the BusinessInternalDebts DynamoDB Table.
 
