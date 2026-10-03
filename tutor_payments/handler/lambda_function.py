@@ -166,7 +166,11 @@ def lambda_handler(event: Dict[str, Union[str, int, float, bool, None]], context
                     emit_metric("PaymentReminderDDB", "PutReminderException")
                     continue
 
-                message_body = f"The total payment for {tutor_calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} ({tutor_salary_rate:.2f}\*{session_hours:.2f} for sessions + {tutor_salary_rate:.2f}\*{no_show_hours:.2f} for no-shows)."
+                previous_owed = round(0.0 - float(tutors_table_item.get(DYNAMODB_KEY_BALANCE) or 0), 2)
+                new_owed = round(previous_owed + amount_due, 2)
+
+                message_body = (f"The total payment for {tutor_calendar_name} from {month_start} to {month_end} due is ${amount_due:.2f} ({tutor_salary_rate:.2f}\*{session_hours:.2f} for sessions + {tutor_salary_rate:.2f}\*{no_show_hours:.2f} for no-shows).\n\n"
+                                f"Total owed: {format_dollars(previous_owed)} (previous balance) + ${amount_due:.2f} = {format_dollars(new_owed)}")
 
                 print(f"Sending Discord message: {message_body}")
                 try:
@@ -348,6 +352,9 @@ def is_valid_session_event(calendar_event_name: str, valid_event_names: set) -> 
             return True
 
     return False
+
+def format_dollars(amount: float) -> str:
+    return f"-${-amount:.2f}" if amount < 0 else f"${amount:.2f}"
 
 def scan_all_items_from_db(table) -> List[Dict]:
     """Scan all items from a DDB table."""
