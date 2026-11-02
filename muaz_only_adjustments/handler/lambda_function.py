@@ -233,6 +233,8 @@ def build_message(period_start: str, period_end: str, student_adjustments: List[
 
     lines.append("")
     lines.append(OFF_THE_BOOKS_NOTICE)
+    lines.append("")
+    lines.append(REFERENCE_DOC_NOTICE)
 
     return "\n".join(lines)
 

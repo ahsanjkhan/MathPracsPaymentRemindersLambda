@@ -39,6 +39,7 @@ SECONDS_PER_HOUR = 3600.0
 
 # Message
 OFF_THE_BOOKS_NOTICE = 'Do NOT record this payment using discord commands after it is sent/received. It is to be handled outside of the MathPracs Payment System'
+REFERENCE_DOC_NOTICE = 'For reference on why this always works: <https://drive.google.com/file/d/177EmS0iL8CuVSrmsXWPlA89fT0GFPydl/view?usp=sharing>'
 
 # Go-live date
 GO_LIVE_DATE = '2026-09-13'

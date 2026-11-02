@@ -16,7 +16,7 @@ The tutor payment reminders are invoked every 1st of the Month at 2:00 PM (Timez
 
 The business payment reminders are invoked every 1st of the Month at 2:00 PM (Timezone America/Chicago).
 
-The Muaz-only adjustments are invoked every 1st of the Month at 2:00 PM (Timezone America/Chicago).
+The Muaz-only adjustments are invoked every 1st of the Month at 2:05 PM (Timezone America/Chicago), after the business payment reminders.
 
 Once the total due is calculated per student/tutor, it stores the result in a DynamoDB Table.
 
